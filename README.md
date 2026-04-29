@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 ## Features
 
 - **7 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — for task creation, updates, execution, and inspection
-- **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, and a Pi-style braille spinner (`⠋⠙⠹⠸`) for active tasks with elapsed time and token counts
+- **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, a Pi-style braille spinner (`⠋⠙⠹⠸`) for active tasks, and a smart viewport that keeps active/actionable work visible in larger lists
 - **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
 - **Dependency and relationship management** — hard `blocks`/`blockedBy` dependencies plus non-blocking relationships such as `parent`, `related`, `validates`, `supersedes`, and `orderAfter`
@@ -52,6 +52,8 @@ The extension renders a persistent widget above the editor:
 | `◼` | In-progress (not actively executing) |
 | `◻` | Pending |
 | `⠋`/`⠙`/`⠹`/`⠸` | Animated braille spinner — actively executing task (shows `activeForm` text, elapsed time, token counts) |
+
+The widget shows a larger default viewport than earlier releases and switches to a smart selection when the list is longer: active or in-progress rows stay visible with parent context, ready parent tasks and unblocked pending work are favored, and hidden ranges are summarized as `… N hidden tasks`. `TaskList` still returns the full task tree on demand.
 
 ## Tools
 

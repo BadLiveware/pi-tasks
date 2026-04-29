@@ -179,16 +179,35 @@ describe("TaskWidget", () => {
     expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
   });
 
-  it("limits visible tasks to MAX_VISIBLE_TASKS", () => {
-    for (let i = 0; i < 15; i++) {
+  it("uses a larger viewport budget with hidden task markers", () => {
+    for (let i = 0; i < 20; i++) {
       store.create(`Task ${i + 1}`, "Desc");
     }
     widget.update();
 
     const lines = renderWidget(ui.state);
-    // header + 10 tasks + "… and 5 more"
-    expect(lines).toHaveLength(12);
-    expect(lines[11]).toContain("5 more");
+    // header + 14 task rows + hidden marker
+    expect(lines).toHaveLength(16);
+    expect(lines[14]).toContain("Task 14");
+    expect(lines[15]).toContain("6 hidden tasks");
+  });
+
+  it("keeps active tasks visible with parent context when the list is long", () => {
+    store.createMany([
+      { key: "root", subject: "Large feature", description: "Parent" },
+      ...Array.from({ length: 20 }, (_, index) => ({
+        subject: `Subtask ${index + 1}`,
+        description: "Desc",
+        relations: [{ type: "parent", target: "root" }],
+      })),
+    ]);
+    store.update("18", { status: "in_progress" });
+    widget.setActiveTask("18", true);
+
+    const lines = renderWidget(ui.state);
+    expect(lines.some(line => line.includes("Large feature"))).toBe(true);
+    expect(lines.some(line => line.includes("Subtask 17…"))).toBe(true);
+    expect(lines.some(line => line.includes("hidden tasks"))).toBe(true);
   });
 
   it("tracks token usage for active tasks", () => {
