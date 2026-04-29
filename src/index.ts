@@ -34,7 +34,7 @@ import {
 import { ProcessTracker } from "./process-tracker.js";
 import { TaskStore } from "./task-store.js";
 import { loadTasksConfig } from "./tasks-config.js";
-import type { TaskCreateInput, TaskRelation, TaskUpdateFields } from "./types.js";
+import type { Task, TaskCreateInput, TaskRelation, TaskUpdateFields } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
 
@@ -88,7 +88,11 @@ const TaskUpdateItemSchema = Type.Object({
 });
 
 type TaskCreateToolParams = { tasks?: TaskCreateInput[] } & Partial<TaskCreateInput>;
-type TaskUpdateToolParams = { updates?: Array<TaskUpdateFields & { taskId: string }>; taskId?: string } & TaskUpdateFields;
+type TaskUpdateToolParams = {
+  updates?: Array<TaskUpdateFields & { taskId: string }>;
+  taskId?: string;
+  includeList?: boolean;
+} & TaskUpdateFields;
 
 function normalizeTaskCreateParams(params: TaskCreateToolParams): TaskCreateInput[] {
   if (Array.isArray(params.tasks)) return params.tasks;
@@ -100,12 +104,38 @@ function normalizeTaskCreateParams(params: TaskCreateToolParams): TaskCreateInpu
 function normalizeTaskUpdateParams(params: TaskUpdateToolParams): Array<TaskUpdateFields & { taskId: string }> {
   if (Array.isArray(params.updates)) return params.updates;
   if (typeof params.taskId !== "string") return [];
-  const { updates: _updates, ...update } = params;
+  const { updates: _updates, includeList: _includeList, ...update } = params;
   return [update as TaskUpdateFields & { taskId: string }];
 }
 
 function formatRelations(relations: TaskRelation[]): string {
   return relations.map(relation => `${relation.type} #${relation.target}`).join(", ");
+}
+
+function formatTaskList(tasks: Task[]): string {
+  if (tasks.length === 0) return "No tasks found";
+
+  const hierarchy = buildTaskHierarchy(tasks);
+  return flattenTaskHierarchy(hierarchy).map(row => {
+    let line = `${row.connectorPrefix}#${row.task.id} [${row.task.status}] ${row.task.subject}`;
+
+    if (row.task.owner) {
+      line += ` (${row.task.owner})`;
+    }
+
+    if (row.summary.total > 0) {
+      line += ` [container ${row.summary.completed}/${row.summary.total} done]`;
+      if (row.readyToComplete) line += " [ready to complete]";
+      if (row.availableChildIds.length > 1) line += ` [parallel ${formatTaskRefs(row.availableChildIds)}]`;
+    }
+
+    const openBlockers = getOpenBlockerIds(row.task, hierarchy);
+    if (openBlockers.length > 0) {
+      line += ` [blocked by ${formatTaskRefs(openBlockers)}]`;
+    }
+
+    return line;
+  }).join("\n");
 }
 
 /** Task tool names — used to detect task tool usage for reminder suppression. */
@@ -572,32 +602,7 @@ Use TaskGet with a specific task ID to view full details including description a
     parameters: Type.Object({}),
 
     execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      const tasks = store.list();
-      if (tasks.length === 0) return Promise.resolve(textResult("No tasks found"));
-
-      const hierarchy = buildTaskHierarchy(tasks);
-      const lines = flattenTaskHierarchy(hierarchy).map(row => {
-        let line = `${row.connectorPrefix}#${row.task.id} [${row.task.status}] ${row.task.subject}`;
-
-        if (row.task.owner) {
-          line += ` (${row.task.owner})`;
-        }
-
-        if (row.summary.total > 0) {
-          line += ` [container ${row.summary.completed}/${row.summary.total} done]`;
-          if (row.readyToComplete) line += " [ready to complete]";
-          if (row.availableChildIds.length > 1) line += ` [parallel ${formatTaskRefs(row.availableChildIds)}]`;
-        }
-
-        const openBlockers = getOpenBlockerIds(row.task, hierarchy);
-        if (openBlockers.length > 0) {
-          line += ` [blocked by ${formatTaskRefs(openBlockers)}]`;
-        }
-
-        return line;
-      });
-
-      return Promise.resolve(textResult(lines.join("\n")));
+      return Promise.resolve(textResult(formatTaskList(store.list())));
     },
   });
 
@@ -709,13 +714,13 @@ Returns full task details:
 
 **Before starting work on a task:**
 - Mark it in_progress BEFORE beginning — do not start work without updating status first
-- After resolving, call TaskList to find your next task
+- Set top-level \`includeList: true\` when you need the updated task summary immediately after the mutation
 
 **Mark tasks as resolved:**
 - When you have completed the work described in a task
 - When a task is no longer needed or has been superseded
 - IMPORTANT: Always mark your assigned tasks as resolved when you finish them
-- After resolving, call TaskList to find your next task
+- After resolving, use \`includeList: true\` when you need the updated list or next available task
 
 - ONLY mark a task as completed when you have FULLY accomplished it
 - If you encounter errors, blockers, or cannot finish, keep it as in_progress
@@ -727,6 +732,7 @@ Returns full task details:
 
 **Update task details and relationships:**
 - Use \`updates\`, an array of update objects. Use one element for a single task.
+- Set top-level \`includeList: true\` to append the post-update TaskList summary when you would otherwise call TaskList immediately afterward.
 - \`addBlocks\` and \`addBlockedBy\` are hard blocking dependencies and affect availability.
 - \`setRelations\`, \`addRelations\`, and \`removeRelations\` manage non-blocking structure such as \`parent\`, \`related\`, \`validates\`, \`supersedes\`, and \`orderAfter\`.
 
@@ -738,6 +744,10 @@ Returns full task details:
 - **metadata**: Shallow merge; set a key to null to delete it
 - **addBlocks** / **addBlockedBy**: Hard dependencies
 - **setRelations** / **addRelations** / **removeRelations**: Non-blocking relationships
+
+## Additional Options
+
+- **includeList**: Optional top-level boolean. When true, append the post-mutation task list summary to avoid a separate TaskList call.
 
 ## Examples
 
@@ -754,9 +764,15 @@ Complete and delete tasks together:
 Add a soft ordering relationship:
 \`\`\`json
 {"updates": [{"taskId": "3", "addRelations": [{"type": "orderAfter", "target": "1"}]}]}
+\`\`\`
+
+Complete a task and include the updated list:
+\`\`\`json
+{"updates": [{"taskId": "1", "status": "completed"}], "includeList": true}
 \`\`\``,
     parameters: Type.Object({
       updates: Type.Array(TaskUpdateItemSchema, { description: "Task updates to apply. Use one element for a single task.", minItems: 1 }),
+      includeList: Type.Optional(Type.Boolean({ description: "Append the post-update TaskList summary to avoid a separate TaskList call" })),
     }),
 
     execute(_toolCallId, params: TaskUpdateToolParams, _signal, _onUpdate, _ctx) {
@@ -797,6 +813,9 @@ Add a soft ordering relationship:
             return `#${id} (${summary.completed}/${summary.total} subtasks done)`;
           }).join(", ")}`);
         }
+      }
+      if (params.includeList) {
+        lines.push("", "Task list:", formatTaskList(store.list()));
       }
       widget.update();
       return Promise.resolve(textResult(lines.join("\n")));

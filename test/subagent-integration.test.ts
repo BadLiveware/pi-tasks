@@ -545,6 +545,23 @@ describe("Standalone operation (no subagents extension)", () => {
     expect(list.content[0].text).not.toContain("#2");
   });
 
+  it("TaskUpdate can append the post-update task list", async () => {
+    await mock.executeTool("TaskCreate", {
+      tasks: [
+        { subject: "Finish me", description: "desc" },
+        { subject: "Next work", description: "desc" },
+      ],
+    });
+
+    const result = await mock.executeTool("TaskUpdate", {
+      updates: [{ taskId: "1", status: "completed" }],
+      includeList: true,
+    });
+
+    expect(result.content[0].text).toContain("Updated task #1 status");
+    expect(result.content[0].text).toContain("Task list:\n#2 [pending] Next work\n#1 [completed] Finish me");
+  });
+
   it("TaskList and TaskGet expose hierarchy and parallel subtasks", async () => {
     await mock.executeTool("TaskCreate", {
       tasks: [

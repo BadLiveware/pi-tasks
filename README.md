@@ -144,7 +144,7 @@ For parent tasks, `TaskGet` also shows direct subtasks, aggregate subtask progre
 
 ### `TaskUpdate`
 
-Update one or more tasks. Pass `updates`, an array of update objects; use one element for a single task.
+Update one or more tasks. Pass `updates`, an array of update objects; use one element for a single task. Set top-level `includeList: true` when you want the post-update task summary in the same response instead of making a separate `TaskList` call.
 
 | Update field | Type | Description |
 |--------------|------|-------------|
@@ -173,6 +173,23 @@ Update one or more tasks. Pass `updates`, an array of update objects; use one el
 ```
 → Updated task #1 status
 → Updated task #2 deleted
+```
+
+To complete a task and immediately see the updated list:
+
+```json
+{
+  "updates": [{ "taskId": "1", "status": "completed" }],
+  "includeList": true
+}
+```
+
+```
+→ Updated task #1 status
+
+Task list:
+#2 [pending] Next work
+#1 [completed] Finish me
 ```
 
 When a batch completes all subtasks for a parent, the response includes a ready-to-complete hint:
