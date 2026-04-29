@@ -5,10 +5,17 @@
  *   ✔ completed tasks (strikethrough + dim)
  *   ◼ in_progress tasks
  *   ◻ pending tasks
- *   ✳/✽ actively executing task (star spinner with activeForm text)
+ *   ⠋/⠙/⠹/⠸ actively executing task (spinner with activeForm text)
  */
 
 import { truncateToWidth } from "@mariozechner/pi-tui";
+import type { TaskHierarchy, TaskHierarchyRow } from "../hierarchy.js";
+import {
+  buildTaskHierarchy,
+  flattenTaskHierarchy,
+  formatTaskRefs,
+  getOpenBlockerIds,
+} from "../hierarchy.js";
 import type { TaskStore } from "../task-store.js";
 
 // ---- Types ----
@@ -28,10 +35,13 @@ export type UICtx = {
   ): void;
 };
 
-/** Star spinner frames for animated active task indicator (matches Claude Code). */
-const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽"];
+/** Pi-style braille spinner frames for animated active task indicators. */
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 180;
 
-const MAX_VISIBLE_TASKS = 10;
+const DEFAULT_VISIBLE_TASK_ROWS = 14;
+const MIN_VISIBLE_TASK_ROWS = 10;
+const MAX_VISIBLE_TASK_ROWS = 18;
 
 /** Per-task runtime metrics (elapsed time, token usage). */
 export interface TaskMetrics {
@@ -56,6 +66,101 @@ function formatDuration(ms: number): string {
 function formatTokens(n: number): string {
   if (n < 1000) return String(n);
   return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, n));
+}
+
+function visibleTaskRowBudget(tui: any): number {
+  const terminalRows = tui?.terminal?.rows;
+  if (typeof terminalRows !== "number" || !Number.isFinite(terminalRows)) return DEFAULT_VISIBLE_TASK_ROWS;
+  return clamp(Math.floor(terminalRows * 0.35), MIN_VISIBLE_TASK_ROWS, MAX_VISIBLE_TASK_ROWS);
+}
+
+type WidgetViewportItem =
+  | { kind: "row"; row: TaskHierarchyRow }
+  | { kind: "marker"; hiddenCount: number };
+
+function isActionable(row: TaskHierarchyRow, hierarchy: TaskHierarchy): boolean {
+  return row.task.status === "pending" && getOpenBlockerIds(row.task, hierarchy).length === 0;
+}
+
+function findFocusIndex(rows: TaskHierarchyRow[], hierarchy: TaskHierarchy, activeTaskIds: Set<string>): number {
+  const activeIndex = rows.findIndex(row => activeTaskIds.has(row.task.id) && row.task.status === "in_progress");
+  if (activeIndex !== -1) return activeIndex;
+
+  const inProgressIndex = rows.findIndex(row => row.task.status === "in_progress");
+  if (inProgressIndex !== -1) return inProgressIndex;
+
+  const readyParentIndex = rows.findIndex(row => row.readyToComplete);
+  if (readyParentIndex !== -1) return readyParentIndex;
+
+  const actionableIndex = rows.findIndex(row => isActionable(row, hierarchy));
+  if (actionableIndex !== -1) return actionableIndex;
+
+  const pendingIndex = rows.findIndex(row => row.task.status === "pending");
+  return pendingIndex !== -1 ? pendingIndex : 0;
+}
+
+function buildWidgetViewport(
+  rows: TaskHierarchyRow[],
+  hierarchy: TaskHierarchy,
+  activeTaskIds: Set<string>,
+  rowBudget: number,
+): WidgetViewportItem[] {
+  if (rows.length <= rowBudget) return rows.map(row => ({ kind: "row", row }));
+
+  const rowIndexByTaskId = new Map(rows.map((row, index) => [row.task.id, index]));
+  const selected = new Set<number>();
+  const focusIndex = findFocusIndex(rows, hierarchy, activeTaskIds);
+  const addIndex = (index: number) => {
+    if (index >= 0 && index < rows.length && selected.size < rowBudget) selected.add(index);
+  };
+  const addWithAncestors = (index: number) => {
+    const chain: number[] = [];
+    let current: TaskHierarchyRow | undefined = rows[index];
+    while (current) {
+      const currentIndex = rowIndexByTaskId.get(current.task.id);
+      if (currentIndex === undefined || chain.includes(currentIndex)) break;
+      chain.unshift(currentIndex);
+      current = current.parentId ? rows[rowIndexByTaskId.get(current.parentId) ?? -1] : undefined;
+    }
+    for (const chainIndex of chain.slice(-rowBudget)) addIndex(chainIndex);
+  };
+
+  addWithAncestors(focusIndex);
+
+  for (let index = 0; index < rows.length && selected.size < rowBudget; index++) {
+    const row = rows[index];
+    if (activeTaskIds.has(row.task.id) || row.task.status === "in_progress" || row.readyToComplete) {
+      addWithAncestors(index);
+    }
+  }
+
+  for (let distance = 1; selected.size < rowBudget && distance < rows.length; distance++) {
+    addIndex(focusIndex - distance);
+    addIndex(focusIndex + distance);
+  }
+
+  for (let index = 0; index < rows.length && selected.size < rowBudget; index++) {
+    addIndex(index);
+  }
+
+  const selectedIndexes = [...selected].sort((a, b) => a - b);
+  const items: WidgetViewportItem[] = [];
+  let previousIndex = -1;
+  for (const index of selectedIndexes) {
+    if (index > previousIndex + 1) items.push({ kind: "marker", hiddenCount: index - previousIndex - 1 });
+    items.push({ kind: "row", row: rows[index] });
+    previousIndex = index;
+  }
+  if (previousIndex < rows.length - 1) items.push({ kind: "marker", hiddenCount: rows.length - previousIndex - 1 });
+  return items;
+}
+
+function formatHiddenTasks(hiddenCount: number): string {
+  return hiddenCount === 1 ? "… 1 hidden task" : `… ${hiddenCount} hidden tasks`;
 }
 
 // ---- Widget ----
@@ -112,7 +217,7 @@ export class TaskWidget {
   /** Ensure the widget update timer is running. */
   ensureTimer() {
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 150);
+      this.widgetInterval = setInterval(() => this.update(), SPINNER_INTERVAL_MS);
     }
   }
 
@@ -137,9 +242,17 @@ export class TaskWidget {
     const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
     const lines: string[] = [truncate(theme.fg("accent", "●") + " " + theme.fg("accent", statusText))];
 
-    const visible = tasks.slice(0, MAX_VISIBLE_TASKS);
-    for (let i = 0; i < visible.length; i++) {
-      const task = visible[i];
+    const hierarchy = buildTaskHierarchy(tasks);
+    const rows = flattenTaskHierarchy(hierarchy);
+    const viewport = buildWidgetViewport(rows, hierarchy, this.activeTaskIds, visibleTaskRowBudget(tui));
+    for (const item of viewport) {
+      if (item.kind === "marker") {
+        lines.push(truncate(theme.fg("dim", `  ${formatHiddenTasks(item.hiddenCount)}`)));
+        continue;
+      }
+
+      const row = item.row;
+      const task = row.task;
       const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
 
       let icon: string;
@@ -153,16 +266,17 @@ export class TaskWidget {
         icon = "◻";
       }
 
-      let suffix = "";
-      if (task.status === "pending" && task.blockedBy.length > 0) {
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = this.store.get(bid);
-          return blocker && blocker.status !== "completed";
-        });
-        if (openBlockers.length > 0) {
-          suffix = theme.fg("dim", ` › blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
-        }
+      const suffixParts: string[] = [];
+      if (row.summary.total > 0) {
+        suffixParts.push(`${row.summary.completed}/${row.summary.total} subtasks`);
+        if (row.readyToComplete) suffixParts.push("ready to complete");
+        if (row.availableChildIds.length > 1) suffixParts.push(`parallel ${formatTaskRefs(row.availableChildIds)}`);
       }
+      const openBlockers = getOpenBlockerIds(task, hierarchy);
+      if (task.status === "pending" && openBlockers.length > 0) {
+        suffixParts.push(`blocked by ${formatTaskRefs(openBlockers)}`);
+      }
+      const suffix = suffixParts.length > 0 ? theme.fg("dim", ` › ${suffixParts.join(" · ")}`) : "";
 
       let text: string;
       if (isActive) {
@@ -180,21 +294,17 @@ export class TaskWidget {
             ? ` ${theme.fg("dim", `(${elapsed} · ${tokenParts.join(" ")})`)}`
             : ` ${theme.fg("dim", `(${elapsed})`)}`;
         }
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${stats}`;
+        text = `  ${row.connectorPrefix}${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${stats}`;
       } else if (task.status === "completed") {
-        text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
+        text = `  ${row.connectorPrefix}${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
       } else {
         const agentSuffix = task.status === "in_progress" && task.metadata?.agentId
           ? theme.fg("dim", ` (agent ${task.metadata.agentId.slice(0, 5)})`)
           : "";
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
+        text = `  ${row.connectorPrefix}${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
       }
 
       lines.push(truncate(text + suffix));
-    }
-
-    if (tasks.length > MAX_VISIBLE_TASKS) {
-      lines.push(truncate(theme.fg("dim", `    … and ${tasks.length - MAX_VISIBLE_TASKS} more`)));
     }
 
     return lines;

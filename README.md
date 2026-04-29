@@ -1,6 +1,6 @@
 # @tintinweb/pi-tasks
 
-A [pi](https://pi.dev) extension that brings **Claude Code-style task tracking and coordination** to pi. Track multi-step work with structured tasks, dependency management, and a persistent visual widget.
+A [pi](https://pi.dev) extension that brings **Claude Code-style task tracking and coordination** to pi. Track multi-step work with batch task creation, hierarchical subtasks, dependency management, and a persistent visual widget.
 
 > **Status:** Early release.
 
@@ -12,11 +12,13 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 
 ## Features
 
-- **7 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — matching Claude Code's exact tool specs and descriptions
-- **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts
+- **7 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — for task creation, updates, execution, and inspection
+- **Batch task mutations** — create whole task sets in one `TaskCreate` call and update/complete/delete multiple tasks in one `TaskUpdate` call
+- **Hierarchical task trees** — model parent/subtask relationships, nested trees, aggregate subtask progress, parallel-capable siblings, and ready-to-complete parent hints
+- **Persistent widget** — live task list above the editor with tree connectors, `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, a Pi-style braille spinner (`⠋⠙⠹⠸`) for active tasks, and a smart viewport that keeps active/actionable work visible in larger lists
 - **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
-- **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references
+- **Dependency and relationship management** — hard `blocks`/`blockedBy` dependencies plus non-blocking relationships such as `parent`, `related`, `validates`, `supersedes`, and `orderAfter`
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
 - **File locking** — concurrent access is safe when multiple sessions share a task list
 - **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop
@@ -41,7 +43,7 @@ The extension renders a persistent widget above the editor:
 ```
 ● 4 tasks (1 done, 1 in progress, 2 open)
   ✔ #1 Design the flux capacitor
-  ✳ #2 Acquiring plutonium… (2m 49s · ↑ 4.1k ↓ 1.2k)
+  ⠙ #2 Acquiring plutonium… (2m 49s · ↑ 4.1k ↓ 1.2k)
   ◻ #3 Install flux capacitor in DeLorean › blocked by #1
   ◻ #4 Test time travel at 88 mph › blocked by #2, #3
 ```
@@ -51,37 +53,76 @@ The extension renders a persistent widget above the editor:
 | `✔` | Completed (strikethrough + dim) |
 | `◼` | In-progress (not actively executing) |
 | `◻` | Pending |
-| `✳`/`✽` | Animated star spinner — actively executing task (shows `activeForm` text, elapsed time, token counts) |
+| `⠋`/`⠙`/`⠹`/`⠸` | Animated braille spinner — actively executing task (shows `activeForm` text, elapsed time, token counts) |
+
+The widget shows a larger default viewport than earlier releases and switches to a smart selection when the list is longer: active or in-progress rows stay visible with parent context, ready parent tasks and unblocked pending work are favored, and hidden ranges are summarized as `… N hidden tasks`. `TaskList` still returns the full task tree on demand.
+
+Long task trees stay focused on current work:
+
+```
+● 26 tasks (1 in progress, 25 open)
+  ◻ #57 Build observatory › 0/25 subtasks
+  … 3 hidden tasks
+  ├─ ◻ #61 Grind primary lens
+  ├─ ◻ #62 Polish mirror
+  ├─ ⠙ #69 Calibrating the first-light target… (44m 50s · ↑ 670.3k ↓ 1.6k)
+  ├─ ◻ #70 Open observation notebook
+  ├─ ◻ #71 Take first-light photo › blocked by #69
+  … 5 hidden tasks
+```
 
 ## Tools
 
 ### `TaskCreate`
 
-Create a structured task. Used proactively for complex multi-step work.
+Create one or more structured tasks. Pass `tasks`, an array of task objects; use one element for a single task.
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
+| Task field | Type | Required | Description |
+|------------|------|----------|-------------|
+| `key` | string | no | Temporary key for references inside this create call |
 | `subject` | string | yes | Brief imperative title |
 | `description` | string | yes | Detailed context and acceptance criteria |
 | `activeForm` | string | no | Present continuous form for spinner (e.g., "Running tests") |
 | `agentType` | string | no | Agent type for subagent execution (e.g., `"general-purpose"`, `"Explore"`) |
 | `metadata` | object | no | Arbitrary key-value pairs |
+| `blocks` | string[] | no | Task IDs or keys this task blocks |
+| `blockedBy` | string[] | no | Task IDs or keys that block this task |
+| `relations` | object[] | no | Non-blocking relationships with `type` and `target` |
+
+```json
+{
+  "tasks": [
+    { "key": "design", "subject": "Design API", "description": "Decide the shape" },
+    {
+      "key": "docs",
+      "subject": "Document API",
+      "description": "Write usage notes",
+      "blockedBy": ["design"],
+      "relations": [{ "type": "validates", "target": "design" }]
+    }
+  ]
+}
+```
 
 ```
-→ Task #1 created successfully: Fix authentication bug
+→ Created 2 tasks:
+#1 Design API
+#2 Document API
 ```
 
 ### `TaskList`
 
-List all tasks with status, owner, and blocked-by info.
+List all tasks with status, owner, blocked-by info, and hierarchy summaries.
 
 ```
-#1 [pending] Fix authentication bug
-#2 [in_progress] Write unit tests (agent-1)
-#3 [pending] Update docs [blocked by #1, #2]
+#1 [pending] Deliver feature [container 1/3 done] [parallel #3, #4]
+├─ #2 [completed] Design API
+├─ #3 [pending] Implement API
+└─ #4 [pending] Write docs
+#5 [pending] Validate feature [blocked by #3, #4]
 ```
 
-Sort order: pending first, then in-progress, then completed (each group by ID).
+Flat lists sort pending first, then in-progress, then completed (each group by ID). Hierarchical lists render parent tasks with tree connectors so container context stays visible.
 
 ### `TaskGet`
 
@@ -92,18 +133,21 @@ Task #2: Write unit tests
 Status: in_progress
 Owner: agent-1
 Description: Add tests for the auth module
+Parent: #1
+Parallel siblings: #4
 Blocked by: #1
 Blocks: #3
+Relations: parent #1, validates #1
 ```
 
-Shows owner (if set) and open (non-completed) dependency edges. Non-empty metadata is displayed as JSON.
+For parent tasks, `TaskGet` also shows direct subtasks, aggregate subtask progress, available parallel subtasks, and ready-to-complete hints. Shows owner (if set), open dependency edges, and non-blocking relationships. Non-empty metadata is displayed as JSON.
 
 ### `TaskUpdate`
 
-Update task fields, status, metadata, and dependencies.
+Update one or more tasks. Pass `updates`, an array of update objects; use one element for a single task.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
+| Update field | Type | Description |
+|--------------|------|-------------|
 | `taskId` | string | Task ID (required) |
 | `status` | `pending` / `in_progress` / `completed` / `deleted` | New status |
 | `subject` | string | New title |
@@ -111,20 +155,35 @@ Update task fields, status, metadata, and dependencies.
 | `activeForm` | string | Spinner text |
 | `owner` | string | Agent name |
 | `metadata` | object | Shallow merge (null values delete keys) |
-| `addBlocks` | string[] | Task IDs this task blocks |
-| `addBlockedBy` | string[] | Task IDs that block this task |
+| `addBlocks` | string[] | Hard dependencies this task blocks |
+| `addBlockedBy` | string[] | Hard dependencies that block this task |
+| `setRelations` | object[] | Replace non-blocking relationships |
+| `addRelations` | object[] | Add non-blocking relationships |
+| `removeRelations` | object[] | Remove matching non-blocking relationships |
+
+```json
+{
+  "updates": [
+    { "taskId": "1", "status": "completed" },
+    { "taskId": "2", "status": "deleted" }
+  ]
+}
+```
 
 ```
 → Updated task #1 status
-→ Updated task #2 owner, status
-→ Updated task #3 blocks
-→ Updated task #3 blocks (warning: cycle: #3 and #1 block each other)
-→ Updated task #1 deleted
+→ Updated task #2 deleted
+```
+
+When a batch completes all subtasks for a parent, the response includes a ready-to-complete hint:
+
+```
+→ Ready to complete: #10 (4/4 subtasks done)
 ```
 
 Setting `status: "deleted"` permanently removes the task.
 
-Dependencies are bidirectional: `addBlocks: ["3"]` on task 1 also adds `blockedBy: ["1"]` to task 3.
+Dependencies are bidirectional: `addBlocks: ["3"]` on task 1 also adds `blockedBy: ["1"]` to task 3. Non-blocking `relations` are directional structure only and do not affect whether a task can start.
 
 ### `TaskOutput`
 
@@ -170,13 +229,50 @@ pending → in_progress → completed
 
 Tasks are created as `pending`. Mark `in_progress` before starting work, `completed` when done. `deleted` removes entirely — IDs never reset.
 
-## Dependency Management
+## Dependency, Hierarchy, and Relationship Management
 
-- **Bidirectional edges:** `addBlocks`/`addBlockedBy` maintain both sides automatically
+- **Batch creation:** `TaskCreate` can create tasks and resolve temporary `key` references in one atomic mutation
+- **Bidirectional hard edges:** `blocks`/`blockedBy` and `addBlocks`/`addBlockedBy` maintain both sides automatically
+- **Hierarchy:** `relations: [{ "type": "parent", "target": "..." }]` nests a subtask under a parent/container task
+- **Parallel subtasks:** Siblings under the same parent with no hard dependency edge between them are shown as parallel-capable; multiple currently unblocked children are shown as `parallel #...`
+- **Non-blocking relations:** `relations`, `setRelations`, `addRelations`, and `removeRelations` record structure without blocking execution
+- **Completion hints:** Parent tasks show aggregate subtask progress and are reported as ready to complete once all subtasks are completed
 - **Dependency warnings:** cycles, self-dependencies, and references to non-existent tasks are stored but produce warnings in the tool response
 - **Display-time filtering:** `TaskList` only shows non-completed blockers in `[blocked by ...]`
-- **Raw data preserved:** `TaskGet` shows ALL edges, including completed blockers
-- **Cleanup on deletion:** removing a task cleans up all edges pointing to it
+- **Raw data preserved:** `TaskGet` shows all hard edges and non-blocking relations
+- **Cleanup on deletion:** removing a task cleans up hard edges and relations pointing to it
+
+Example nested task set:
+
+```json
+{
+  "tasks": [
+    { "key": "feature", "subject": "Deliver feature", "description": "Container task" },
+    {
+      "key": "api",
+      "subject": "Implement API",
+      "description": "Build the endpoint",
+      "relations": [{ "type": "parent", "target": "feature" }]
+    },
+    {
+      "key": "docs",
+      "subject": "Write docs",
+      "description": "Document the endpoint",
+      "relations": [{ "type": "parent", "target": "feature" }]
+    },
+    {
+      "key": "validate",
+      "subject": "Validate feature",
+      "description": "Run checks after implementation and docs",
+      "blockedBy": ["api", "docs"],
+      "relations": [
+        { "type": "parent", "target": "feature" },
+        { "type": "validates", "target": "feature" }
+      ]
+    }
+  ]
+}
+```
 
 ## Task Storage
 
