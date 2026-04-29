@@ -72,6 +72,10 @@ function isProcessRunning(pid: number): boolean {
   }
 }
 
+function ensureParentDirectory(filePath: string): void {
+  mkdirSync(dirname(filePath), { recursive: true });
+}
+
 function relationKey(relation: TaskRelation): string {
   return `${relation.type}\0${relation.target}`;
 }
@@ -92,7 +96,7 @@ export class TaskStore {
     if (!listIdOrPath) return;
     const isAbsPath = isAbsolute(listIdOrPath);
     const filePath = isAbsPath ? listIdOrPath : join(TASKS_DIR, `${listIdOrPath}.json`);
-    mkdirSync(dirname(filePath), { recursive: true });
+    ensureParentDirectory(filePath);
     this.filePath = filePath;
     this.lockPath = filePath + ".lock";
     this.load();
@@ -127,6 +131,7 @@ export class TaskStore {
       nextId: this.nextId,
       tasks: Array.from(this.tasks.values()),
     };
+    ensureParentDirectory(this.filePath);
     const tmpPath = this.filePath + ".tmp";
     writeFileSync(tmpPath, JSON.stringify(data, null, 2));
     renameSync(tmpPath, this.filePath);
@@ -135,6 +140,7 @@ export class TaskStore {
   /** Execute a mutation with file locking (if file-backed). */
   private withLock<T>(fn: () => T): T {
     if (!this.lockPath) return fn();
+    if (this.filePath) ensureParentDirectory(this.filePath);
     acquireLock(this.lockPath);
     try {
       this.load(); // Re-read latest state

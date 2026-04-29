@@ -463,4 +463,24 @@ describe("TaskStore (absolute path)", () => {
     const raw = JSON.parse(readFileSync(absFilePath, "utf-8"));
     expect(raw.tasks).toHaveLength(2);
   });
+
+  it("recreates a missing backing directory before mutations", () => {
+    const storeDir = join(tmpdir(), `pi-tasks-missing-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const storePath = join(storeDir, "tasks.json");
+
+    try {
+      const store = new TaskStore(storePath);
+      store.create("Completed", "Desc");
+      store.update("1", { status: "completed" });
+      rmSync(storeDir, { recursive: true, force: true });
+
+      expect(() => store.clearCompleted()).not.toThrow();
+      expect(store.list()).toHaveLength(0);
+
+      const raw = JSON.parse(readFileSync(storePath, "utf-8"));
+      expect(raw.tasks).toHaveLength(0);
+    } finally {
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
 });
