@@ -305,7 +305,7 @@ export class TaskStore {
           id: String(this.nextId++),
           subject: input.subject,
           description: input.description,
-          status: "pending",
+          status: input.status ?? "pending",
           activeForm: input.activeForm,
           owner: undefined,
           metadata,

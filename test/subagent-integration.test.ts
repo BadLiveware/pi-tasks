@@ -523,6 +523,19 @@ describe("Standalone operation (no subagents extension)", () => {
     expect(task.content[0].text).toContain("Relations: validates #1");
   });
 
+  it("TaskCreate can create the first task as in_progress", async () => {
+    await mock.executeTool("TaskCreate", {
+      tasks: [
+        { subject: "Start me", description: "desc", status: "in_progress" },
+        { subject: "Queued", description: "desc" },
+      ],
+    });
+
+    const list = await mock.executeTool("TaskList", {});
+    expect(list.content[0].text).toContain("#1 [in_progress] Start me");
+    expect(list.content[0].text).toContain("#2 [pending] Queued");
+  });
+
   it("TaskUpdate applies an update batch", async () => {
     await mock.executeTool("TaskCreate", {
       tasks: [

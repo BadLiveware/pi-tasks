@@ -60,6 +60,11 @@ const TaskCreateItemSchema = Type.Object({
   key: Type.Optional(Type.String({ description: "Temporary key for references within this TaskCreate call" })),
   subject: Type.String({ description: "A brief title for the task" }),
   description: Type.String({ description: "A detailed description of what needs to be done" }),
+  status: Type.Optional(Type.Unsafe<"pending" | "in_progress">({
+    type: "string",
+    enum: ["pending", "in_progress"],
+    description: "Initial task status. Defaults to pending; use in_progress for the task you are starting immediately.",
+  })),
   activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in the spinner when in_progress" })),
   agentType: Type.Optional(Type.String({ description: "Agent type for subagent execution" })),
   metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
@@ -531,13 +536,14 @@ Each task supports:
 - **key**: Temporary key for references inside this create call
 - **subject**: A brief, actionable title in imperative form
 - **description**: Detailed context and acceptance criteria
+- **status**: Optional initial status, \`pending\` or \`in_progress\`; use \`in_progress\` for the task you are starting immediately
 - **activeForm**: Present continuous form shown in the spinner when in_progress
 - **agentType**: Agent type for subagent execution via TaskExecute
 - **metadata**: Arbitrary metadata
 - **blocks** / **blockedBy**: Hard dependencies using task IDs or keys from this call
 - **relations**: Non-blocking relationships, e.g. \`parent\`, \`related\`, \`validates\`, \`supersedes\`, or \`orderAfter\`
 
-All tasks are created with status \`pending\`.
+Tasks default to status \`pending\`. Set \`status: "in_progress"\` on the task you are starting immediately to avoid a follow-up TaskUpdate call.
 
 ## Tips
 
@@ -560,6 +566,9 @@ All tasks are created with status \`pending\`.
 
       autoClear.resetBatchCountdown();
       const { tasks, warnings } = store.createMany(inputs);
+      for (const task of tasks) {
+        if (task.status === "in_progress") widget.setActiveTask(task.id);
+      }
       widget.update();
 
       const lines = tasks.length === 1

@@ -82,6 +82,7 @@ Create one or more structured tasks. Pass `tasks`, an array of task objects; use
 | `key` | string | no | Temporary key for references inside this create call |
 | `subject` | string | yes | Brief imperative title |
 | `description` | string | yes | Detailed context and acceptance criteria |
+| `status` | `pending` / `in_progress` | no | Initial status; defaults to `pending`. Use `in_progress` for the task you are starting immediately |
 | `activeForm` | string | no | Present continuous form for spinner (e.g., "Running tests") |
 | `agentType` | string | no | Agent type for subagent execution (e.g., `"general-purpose"`, `"Explore"`) |
 | `metadata` | object | no | Arbitrary key-value pairs |
@@ -92,7 +93,7 @@ Create one or more structured tasks. Pass `tasks`, an array of task objects; use
 ```json
 {
   "tasks": [
-    { "key": "design", "subject": "Design API", "description": "Decide the shape" },
+    { "key": "design", "subject": "Design API", "description": "Decide the shape", "status": "in_progress" },
     {
       "key": "docs",
       "subject": "Document API",

@@ -3,6 +3,7 @@
  */
 
 export type TaskStatus = "pending" | "in_progress" | "completed";
+export type TaskCreateStatus = "pending" | "in_progress";
 
 export type TaskRelationType = "parent" | "related" | "validates" | "supersedes" | "orderAfter" | (string & {});
 
@@ -15,6 +16,7 @@ export interface TaskCreateInput {
   key?: string;
   subject: string;
   description: string;
+  status?: TaskCreateStatus;
   activeForm?: string;
   agentType?: string;
   metadata?: Record<string, any>;

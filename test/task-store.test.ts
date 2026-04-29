@@ -29,6 +29,17 @@ describe("TaskStore (in-memory)", () => {
     expect(t.metadata).toEqual({ key: "value" });
   });
 
+  it("creates tasks with initial in_progress status", () => {
+    const { tasks } = store.createMany([
+      { subject: "Running task", description: "Desc", status: "in_progress" },
+      { subject: "Queued task", description: "Desc" },
+    ]);
+
+    expect(tasks[0].status).toBe("in_progress");
+    expect(tasks[1].status).toBe("pending");
+    expect(store.get("1")!.status).toBe("in_progress");
+  });
+
   it("gets a task by ID", () => {
     store.create("Test", "Desc");
     const task = store.get("1");
