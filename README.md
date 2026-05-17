@@ -17,6 +17,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **Hierarchical task trees** — model parent/subtask relationships, nested trees, aggregate subtask progress, parallel-capable siblings, and ready-to-complete parent hints
 - **Persistent widget** — live task list above the editor with tree connectors, `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, a Pi-style braille spinner (`⠋⠙⠹⠸`) for active tasks, and a smart viewport that keeps active/actionable work visible in larger lists
 - **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
+- **Stop-hook cleanup prompt** — when an agent stops with open tasks, pi-tasks injects a follow-up prompt asking it to complete finished tasks, delete obsolete ones, or keep working real in-scope work instead of leaving abandoned rows behind
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
 - **Dependency and relationship management** — hard `blocks`/`blockedBy` dependencies plus non-blocking relationships such as `parent`, `related`, `validates`, `supersedes`, and `orderAfter`
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
@@ -316,6 +317,10 @@ The `autoClearCompleted` setting controls automatic cleanup of completed tasks:
 
 Both auto-clear modes use a turn-based delay for non-jarring UX — tasks linger briefly so you see the completion before they disappear.
 
+### Stop-hook open task cleanup
+
+On `agent_end`, if pending or in-progress tasks remain and no other extension follow-up is pending, pi-tasks injects a follow-up prompt that tells the agent to resolve the list before stopping: complete only fully finished tasks, delete obsolete or accidental tasks, and continue real in-scope work instead of leaving stale tasks behind. The hook fingerprints the current open-task snapshot so the same unresolved list is not re-prompted in a loop; new user input resets the prompt gate.
+
 Settings (`taskScope`, `autoCascade`, `autoClearCompleted`) are saved to `<cwd>/.pi/tasks-config.json`.
 
 ### Override via environment variables
@@ -418,6 +423,7 @@ src/
 ├── types.ts            # Task, TaskStatus, BackgroundProcess types
 ├── task-store.ts       # File-backed store with CRUD, dependencies, locking
 ├── auto-clear.ts       # Turn-based auto-clearing of completed tasks (AutoClearManager)
+├── stop-hook.ts        # agent_end follow-up prompt for unresolved task cleanup
 ├── tasks-config.ts     # Config persistence (taskScope, autoCascade, autoClearCompleted) → .pi/tasks-config.json
 ├── process-tracker.ts  # Background process output buffering and stop
 └── ui/
@@ -434,7 +440,7 @@ src/
 ```bash
 npm install
 npm run typecheck   # TypeScript validation
-npm test            # Run unit tests (145 tests)
+npm test            # Run unit tests
 ```
 
 ## License

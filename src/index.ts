@@ -32,6 +32,7 @@ import {
   getSubtaskSummary,
 } from "./hierarchy.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { consumeStopHookSystemPrompt, createStopHookState, maybePromptForOpenTasks, resetStopHookPrompt } from "./stop-hook.js";
 import { TaskStore } from "./task-store.js";
 import { loadTasksConfig } from "./tasks-config.js";
 import type { Task, TaskCreateInput, TaskRelation, TaskUpdateFields } from "./types.js";
@@ -296,6 +297,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
+  const stopHookState = createStopHookState();
 
   // ── Subagent completion listener ──
   // Listens for subagent lifecycle events to update task status and optionally cascade.
@@ -413,6 +415,18 @@ export default function (pi: ExtensionAPI) {
     if (autoClear.onTurnStart(currentTurn)) widget.update();
   });
 
+  pi.on("input", async (event: any) => {
+    if (event?.source !== "extension") resetStopHookPrompt(stopHookState);
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    latestCtx = ctx;
+    widget.setUICtx(ctx.ui as UICtx);
+    upgradeStoreIfNeeded(ctx);
+    showPersistedTasks();
+    maybePromptForOpenTasks(pi as any, ctx, store.list(), stopHookState);
+  });
+
   // ── Token usage tracking ──
   // Feed per-turn token counts from assistant messages into the widget.
   pi.on("turn_end", async (event) => {
@@ -451,7 +465,7 @@ export default function (pi: ExtensionAPI) {
 
   // Grab UI context early — before_agent_start fires before any tool calls,
   // so persisted tasks show up immediately on session start.
-  pi.on("before_agent_start", async (_event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
@@ -460,6 +474,8 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(pendingWarning, "warning");
       pendingWarning = undefined;
     }
+    const stopHookPrompt = consumeStopHookSystemPrompt(stopHookState);
+    if (stopHookPrompt) return { systemPrompt: `${event.systemPrompt}\n\n${stopHookPrompt}` };
   });
 
   // session_switch fires on /new (reason: "new") and /resume (reason: "resume").
