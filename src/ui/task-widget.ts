@@ -8,7 +8,7 @@
  *   ⠋/⠙/⠹/⠸ actively executing task (spinner with activeForm text)
  */
 
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { TaskHierarchy, TaskHierarchyRow } from "../hierarchy.js";
 import {
   buildTaskHierarchy,
