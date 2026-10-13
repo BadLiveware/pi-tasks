@@ -3,138 +3,296 @@
  * auto-cascade, and widget agent ID display.
  */
 
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import initExtension from "../src/index.js";
+import { sessionTaskFile, workspaceSessionTaskFile } from "../src/task-paths.js";
 import { TaskStore } from "../src/task-store.js";
 import { TaskWidget, type Theme, type UICtx } from "../src/ui/task-widget.js";
+import { installSubagentsMock, type MockEventBus, mockCtx, mockPi, mockSessionCtx } from "./helpers/mock-pi.js";
+
+// Config is mocked rather than written to <cwd>/.pi/tasks-config.json: writing the
+// real file would clobber the user's project settings, and reading it would let the
+// developer's global <agentDir>/tasks-config.json leak into the results.
+const config = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
+vi.mock("../src/tasks-config.js", () => ({
+  loadGlobalTasksConfig: () => ({ ...config.current }),
+  loadTasksConfig: () => ({ ...config.current }),
+  saveTasksConfig: () => {},
+}));
 
 // Force in-memory task store for all integration tests — prevents file-backed
 // store from loading stale tasks across test instances.
-beforeEach(() => { process.env.PI_TASKS = "off"; });
+beforeEach(() => {
+  process.env.PI_TASKS = "off";
+  config.current = {};
+});
 afterEach(() => { delete process.env.PI_TASKS; });
 
-// ---- Mock pi ----
-
-type MockEventBus = {
-  on: (channel: string, handler: (data: unknown) => void) => () => void;
-  emit: (channel: string, data: unknown) => void;
-};
-
-/** Minimal mock of ExtensionAPI with events, tool capture, and event hooks. */
-function mockPi() {
-  const tools = new Map<string, any>();
-  const commands = new Map<string, any>();
-  const eventHandlers = new Map<string, ((data: unknown) => void)[]>();
-  const lifecycleHandlers = new Map<string, ((...args: any[]) => any)[]>();
-
-  const pi = {
-    registerTool(def: any) { tools.set(def.name, def); },
-    registerCommand(name: string, def: any) { commands.set(name, def); },
-    on(event: string, handler: any) {
-      if (!lifecycleHandlers.has(event)) lifecycleHandlers.set(event, []);
-      lifecycleHandlers.get(event)!.push(handler);
-    },
-    events: {
-      emit(channel: string, data: unknown) {
-        for (const h of eventHandlers.get(channel) ?? []) h(data);
-      },
-      on(channel: string, handler: (data: unknown) => void) {
-        if (!eventHandlers.has(channel)) eventHandlers.set(channel, []);
-        eventHandlers.get(channel)!.push(handler);
-        return () => {
-          const arr = eventHandlers.get(channel);
-          if (arr) eventHandlers.set(channel, arr.filter(h => h !== handler));
-        };
-      },
-    },
-    sendUserMessage: vi.fn(),
-  };
-
-  return {
-    pi,
-    tools,
-    commands,
-    /** Execute a registered tool by name. */
-    async executeTool(name: string, params: any, ctx?: any) {
-      const tool = tools.get(name);
-      if (!tool) throw new Error(`Tool ${name} not registered`);
-      return tool.execute("call-1", params, undefined, undefined, ctx ?? mockCtx());
-    },
-    /** Fire lifecycle event handlers (turn_start, tool_result, etc.) */
-    async fireLifecycle(event: string, ...args: any[]) {
-      for (const h of lifecycleHandlers.get(event) ?? []) {
-        await h(...args);
-      }
-    },
-    /** Emit an event on pi.events (simulates subagent extension). */
-    emitEvent(channel: string, data: unknown) {
-      pi.events.emit(channel, data);
-    },
-  };
-}
-
-/** Minimal mock ExtensionContext. */
-function mockCtx() {
-  return {
-    model: { id: "test-model", name: "Test" },
-    modelRegistry: {},
-    ui: {
-      setWidget: vi.fn(),
-      setStatus: vi.fn(),
-      notify: vi.fn(),
-    },
-  };
-}
-
-// ---- Mock subagents extension (RPC responders) ----
-
-/** Simulates the @tintinweb/pi-subagents extension: responds to ping + spawn RPCs and emits ready. */
-function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?: string }) {
-  let idCounter = 0;
-  const spawned: Array<{ id: string; type: string; prompt: string; options: any }> = [];
-  const stopped: string[] = [];
-
-  // Respond to ping — reply on scoped channel
-  const unsubPing = pi.events.on("subagents:rpc:ping", (data: unknown) => {
-    const { requestId } = data as { requestId: string };
-    pi.events.emit(`subagents:rpc:ping:reply:${requestId}`, { success: true, data: { version: 2 } });
+describe("Session task rehydration", () => {
+  // Task paths resolve against the session workspace (ctx.cwd), so every test gets
+  // its own: .pi/ in the real working directory holds the developer's own task list.
+  let cwd: string;
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "pi-tasks-session-"));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(cwd, { recursive: true, force: true });
   });
 
-  // Respond to spawn — reply on scoped channel
-  const unsubSpawn = pi.events.on("subagents:rpc:spawn", (data: unknown) => {
-    const { requestId, type, prompt, options } = data as {
-      requestId: string; type: string; prompt: string; options?: any;
-    };
-    if (opts?.spawnError) {
-      pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: false, error: opts.spawnError });
-      return;
-    }
-    const id = `agent-${++idCounter}`;
-    spawned.push({ id, type, prompt, options });
-    pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: true, data: { id } });
-  });
+  const sessionCtx = (sessionId: string) => mockSessionCtx(sessionId, { cwd });
+  const sessionFile = (sessionId: string) => sessionTaskFile(cwd, sessionId, "session");
 
-  // Respond to stop — reply on scoped channel
-  const unsubStop = pi.events.on("subagents:rpc:stop", (data: unknown) => {
-    const { requestId, agentId } = data as { requestId: string; agentId: string };
-    const known = spawned.some(s => s.id === agentId);
-    if (known) {
-      stopped.push(agentId);
-      pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, { success: true });
-    } else {
-      pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, { success: false, error: "Agent not found" });
+  it("renders default session-scoped tasks immediately after reload", async () => {
+    const sessionId = `reload-${process.pid}-${Date.now()}`;
+    const taskFile = sessionFile(sessionId);
+    try {
+      new TaskStore(taskFile).create("Review the rerun", "Inspect final results");
+      delete process.env.PI_TASKS;
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+      const ctx = sessionCtx(sessionId);
+
+      await mock.fireLifecycle("session_start", { reason: "reload" }, ctx);
+
+      expect(ctx.sessionManager.getSessionId).toHaveBeenCalledOnce();
+      expect(ctx.ui.setWidget).toHaveBeenCalledWith("tasks", expect.any(Function), {
+        placement: "aboveEditor",
+      });
+    } finally {
+      rmSync(taskFile, { force: true });
     }
   });
 
-  // Broadcast readiness
-  pi.events.emit("subagents:ready", {});
+  it("renders tasks from a PI_TASKS path override after reload", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-tasks-reload-"));
+    const taskFile = join(directory, "tasks.json");
+    try {
+      new TaskStore(taskFile).create("Review the rerun", "Inspect final results");
+      process.env.PI_TASKS = taskFile;
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+      const ctx = mockCtx(cwd);
 
-  return {
-    spawned,
-    stopped,
-    unsub() { unsubPing(); unsubSpawn(); unsubStop(); },
+      await mock.fireLifecycle("session_start", { reason: "reload" }, ctx);
+
+      expect(ctx.ui.setWidget).toHaveBeenCalledWith("tasks", expect.any(Function), {
+        placement: "aboveEditor",
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("renders persisted tasks after /resume", async () => {
+    const sessionId = `resume-${process.pid}-${Date.now()}`;
+    const taskFile = sessionFile(sessionId);
+    try {
+      new TaskStore(taskFile).create("Resume this", "Pick up where we left off");
+      delete process.env.PI_TASKS;
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+      const ctx = sessionCtx(sessionId);
+
+      await mock.fireLifecycle("session_start", { reason: "resume" }, ctx);
+
+      expect(ctx.ui.setWidget).toHaveBeenCalledWith("tasks", expect.any(Function), {
+        placement: "aboveEditor",
+      });
+    } finally {
+      rmSync(taskFile, { force: true });
+    }
+  });
+
+  it("switches the session-scoped store to the new session on /new", async () => {
+    const sessionA = `switch-a-${process.pid}-${Date.now()}`;
+    const sessionB = `switch-b-${process.pid}-${Date.now()}`;
+    const fileA = sessionFile(sessionA);
+    const fileB = sessionFile(sessionB);
+    try {
+      new TaskStore(fileA).create("Task in A", "desc");
+      new TaskStore(fileB).create("Task in B", "desc");
+      delete process.env.PI_TASKS;
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+
+      const ctxA = sessionCtx(sessionA);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctxA);
+      expect(ctxA.sessionManager.getSessionId).toHaveBeenCalledOnce();
+
+      // /new must re-point at the new session file. This was previously handled
+      // by the never-emitted session_switch event, leaving the store on session A.
+      const ctxB = sessionCtx(sessionB);
+      await mock.fireLifecycle("session_start", { reason: "new" }, ctxB);
+      expect(ctxB.sessionManager.getSessionId).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(fileA, { force: true });
+      rmSync(fileB, { force: true });
+    }
+  });
+
+  it("seeds a forked session with an independent copy of the parent's tasks", async () => {
+    const parent = `fork-parent-${process.pid}-${Date.now()}`;
+    const child = `fork-child-${process.pid}-${Date.now()}`;
+    const parentFile = sessionFile(parent);
+    const childFile = sessionFile(child);
+    try {
+      new TaskStore(parentFile).create("Inherited task", "carry me into the fork");
+      delete process.env.PI_TASKS;
+      const mock = mockPi();
+      initExtension(mock.pi as any);
+
+      const ctxP = sessionCtx(parent);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, ctxP);
+
+      // /fork re-points to a brand-new (empty) session file. Without seeding, the
+      // fork would silently lose the parent's tasks; with it, the fork gets an
+      // independent copy that does not write back to the parent.
+      const ctxC = sessionCtx(child);
+      await mock.fireLifecycle("session_start", { reason: "fork" }, ctxC);
+
+      const forked = new TaskStore(childFile).list();
+      expect(forked.map(t => t.subject)).toEqual(["Inherited task"]);
+
+      // The fork is independent — mutating it must not touch the parent's file.
+      new TaskStore(childFile).create("Fork-only task", "not in parent");
+      expect(new TaskStore(parentFile).list().map(t => t.subject)).toEqual(["Inherited task"]);
+    } finally {
+      rmSync(parentFile, { force: true });
+      rmSync(childFile, { force: true });
+    }
+  });
+});
+
+describe("Workspace-scoped store resolution", () => {
+  // Paths come from ExtensionContext.cwd, not process.cwd(). The two match in the
+  // terminal host, but a long-lived host serving sessions from another directory
+  // would otherwise write every workspace's tasks into its own.
+  const workspaces: string[] = [];
+  const workspace = (label: string) => {
+    const dir = mkdtempSync(join(tmpdir(), `pi-tasks-${label}-`));
+    workspaces.push(dir);
+    return dir;
   };
-}
+
+  afterEach(() => {
+    for (const dir of workspaces.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("namespaces session tasks by ctx.cwd instead of the host process cwd", async () => {
+    const cwd = workspace("workspace");
+    const sessionId = `ctx-cwd-${process.pid}-${Date.now()}`;
+    const taskFile = workspaceSessionTaskFile(cwd, sessionId);
+    const hostTaskFile = workspaceSessionTaskFile(process.cwd(), sessionId);
+    delete process.env.PI_TASKS;
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    const ctx = mockSessionCtx(sessionId, { cwd });
+
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+    await mock.executeTool("TaskCreate", {
+      subject: "Workspace task",
+      description: "Must use the session workspace",
+    }, ctx);
+
+    expect(new TaskStore(taskFile).list().map(t => t.subject)).toEqual(["Workspace task"]);
+    expect(existsSync(hostTaskFile)).toBe(false);
+  });
+
+  it("keeps identical session IDs isolated between workspaces", async () => {
+    const cwdA = workspace("namespace-a");
+    const cwdB = workspace("namespace-b");
+    const sessionId = `shared-${process.pid}-${Date.now()}`;
+    delete process.env.PI_TASKS;
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    const ctxA = mockSessionCtx(sessionId, { cwd: cwdA });
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctxA);
+    await mock.executeTool("TaskCreate", { subject: "Workspace A", description: "d" }, ctxA);
+
+    const ctxB = mockSessionCtx(sessionId, { cwd: cwdB });
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctxB);
+    await mock.executeTool("TaskCreate", { subject: "Workspace B", description: "d" }, ctxB);
+
+    expect(sessionTaskFile(cwdA, sessionId, "session")).not.toBe(sessionTaskFile(cwdB, sessionId, "session"));
+    expect(new TaskStore(sessionTaskFile(cwdA, sessionId, "session")).list().map(t => t.subject)).toEqual(["Workspace A"]);
+    expect(new TaskStore(sessionTaskFile(cwdB, sessionId, "session")).list().map(t => t.subject)).toEqual(["Workspace B"]);
+  });
+
+  it("loads project scope from ctx.cwd and stores the shared task list there", async () => {
+    const cwd = workspace("project-scope");
+    config.current = { taskScope: "project" };
+    delete process.env.PI_TASKS;
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    const ctx = mockCtx(cwd);
+
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+    await mock.executeTool("TaskCreate", {
+      subject: "Shared workspace task",
+      description: "Must use the project-scoped store",
+    }, ctx);
+
+    const taskFile = join(cwd, ".pi", "tasks", "tasks.json");
+    expect(new TaskStore(taskFile).list().map(t => t.subject)).toEqual(["Shared workspace task"]);
+  });
+
+  it("resolves relative PI_TASKS paths from ctx.cwd", async () => {
+    const cwd = workspace("relative");
+    process.env.PI_TASKS = "./state/tasks.json";
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    const ctx = mockCtx(cwd);
+
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctx);
+    await mock.executeTool("TaskCreate", {
+      subject: "Relative override task",
+      description: "Must resolve relative to the session workspace",
+    }, ctx);
+
+    const taskFile = join(cwd, "state", "tasks.json");
+    expect(new TaskStore(taskFile).list().map(t => t.subject)).toEqual(["Relative override task"]);
+  });
+
+  it("switches session stores when the session ID changes in the same workspace", async () => {
+    const cwd = workspace("session-switch");
+    const sessionA = `same-cwd-a-${process.pid}-${Date.now()}`;
+    const sessionB = `same-cwd-b-${process.pid}-${Date.now()}`;
+    delete process.env.PI_TASKS;
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+    const ctxA = mockSessionCtx(sessionA, { cwd });
+    const ctxB = mockSessionCtx(sessionB, { cwd });
+
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctxA);
+    await mock.executeTool("TaskCreate", { subject: "Task A", description: "Session A" }, ctxA);
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctxB);
+    await mock.executeTool("TaskCreate", { subject: "Task B", description: "Session B" }, ctxB);
+
+    const file = (id: string) => sessionTaskFile(cwd, id, "session");
+    expect(new TaskStore(file(sessionA)).list().map(t => t.subject)).toEqual(["Task A"]);
+    expect(new TaskStore(file(sessionB)).list().map(t => t.subject)).toEqual(["Task B"]);
+  });
+
+  it("keeps an in-memory store when the context cwd changes", async () => {
+    const ctxA = mockCtx(workspace("memory-a"));
+    const ctxB = mockCtx(workspace("memory-b"));
+    process.env.PI_TASKS = "off";
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.fireLifecycle("session_start", { reason: "startup" }, ctxA);
+    await mock.executeTool("TaskCreate", { subject: "Memory task", description: "Keep me" }, ctxA);
+    await mock.fireLifecycle("turn_start", {}, ctxB);
+
+    const result = await mock.executeTool("TaskList", {}, ctxB);
+    expect(result.content[0].text).toContain("Memory task");
+  });
+});
 
 // ---- Tests ----
 
@@ -354,6 +512,60 @@ describe("Completion listener", () => {
 
     const result = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(result.content[0].text).toContain("Status: pending");
+  });
+
+  it("completes the task and keeps the partial result when the agent was stopped", async () => {
+    // status "stopped" is an intentional stop, not a failure — the inverse of the
+    // error branch above: the task completes and whatever the agent produced is kept.
+    await mock.executeTool("TaskCreate", {
+      subject: "Stopped task",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+
+    mock.emitEvent("subagents:failed", { id: "agent-1", result: "partial work", status: "stopped" });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: completed");
+    expect(result.content[0].text).toContain("partial work");
+  });
+
+  it("keeps an earlier result when a stopped agent reports none", async () => {
+    await mock.executeTool("TaskCreate", {
+      subject: "Stopped task",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await mock.executeTool("TaskUpdate", { taskId: "1", metadata: { result: "earlier output" } });
+
+    mock.emitEvent("subagents:failed", { id: "agent-1", status: "stopped" });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: completed");
+    expect(result.content[0].text).toContain("earlier output");
+  });
+
+  it("drops an earlier result when a retry fails", async () => {
+    // The inverse of the two stopped-agent cases above: a task back to pending has
+    // no current result, so the previous run's must not outlive the failure — it
+    // would otherwise outrank lastError in TaskOutput and reach a cascaded agent's
+    // prompt as if it were this task's output.
+    await mock.executeTool("TaskCreate", {
+      subject: "Retried task",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await mock.executeTool("TaskUpdate", { taskId: "1", metadata: { result: "earlier output" } });
+
+    mock.emitEvent("subagents:failed", { id: "agent-1", error: "Out of turns", status: "error" });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: pending");
+    expect(result.content[0].text).toContain("Out of turns");
+    expect(result.content[0].text).not.toContain("earlier output");
   });
 
   it("ignores events for unknown agent IDs", async () => {
@@ -614,7 +826,11 @@ describe("Standalone operation (no subagents extension)", () => {
       agentType: "general-purpose",
     });
     const result = await mock.executeTool("TaskExecute", { task_ids: ["1"] });
-    expect(result.content[0].text).toContain("Subagent execution is currently unavailable");
+    const text = result.content[0].text;
+    expect(text).toContain("Subagent execution is currently unavailable");
+    // Offers the plain Agent tool as a fallback, with the tracking caveat.
+    expect(text).toContain("Agent-tool spawns");
+    expect(text).toContain("won't track them");
   });
 
   it("subagents lifecycle events are silently ignored without mapped agents", () => {
@@ -1001,12 +1217,7 @@ describe("Cascade data injection (buildTaskPrompt)", () => {
   let rpc: ReturnType<typeof installSubagentsMock>;
 
   beforeEach(async () => {
-    // Enable autoCascade via config file in cwd
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const configPath = path.join(process.cwd(), ".pi", "tasks-config.json");
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify({ autoCascade: true }));
+    config.current = { autoCascade: true };
 
     mock = mockPi();
     rpc = installSubagentsMock(mock.pi);
@@ -1016,11 +1227,8 @@ describe("Cascade data injection (buildTaskPrompt)", () => {
     await mock.fireLifecycle("turn_start", {}, mockCtx());
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     rpc.unsub();
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    try { fs.unlinkSync(path.join(process.cwd(), ".pi", "tasks-config.json")); } catch {}
   });
 
   it("injects prerequisite result into cascaded agent prompt", async () => {

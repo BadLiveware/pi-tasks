@@ -28,14 +28,24 @@ import {
   getOpenBlockerIds,
   getParallelSiblingIds,
   getParentId,
-  getReadyParentIds,
   getSubtaskSummary,
 } from "./hierarchy.js";
 import { ProcessTracker } from "./process-tracker.js";
+import {
+  type CadenceConfig,
+  createCadenceState,
+  drainReminderForContext,
+  evaluateToolResult,
+  onTurnStart,
+  resetCadenceState,
+} from "./reminder-cadence.js";
 import { consumeStopHookSystemPrompt, createStopHookState, maybePromptForOpenTasks, resetStopHookPrompt } from "./stop-hook.js";
+import { resolveTaskGlyphs } from "./task-glyphs.js";
+import { registerTaskMutationTools } from "./task-mutation-tools.js";
+import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
 import { TaskStore } from "./task-store.js";
-import { loadTasksConfig } from "./tasks-config.js";
-import type { Task, TaskCreateInput, TaskRelation, TaskUpdateFields } from "./types.js";
+import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
+import type { Task, TaskRelation } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
 
@@ -50,68 +60,6 @@ function debug(...args: unknown[]) {
 
 function textResult(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], details: undefined as any };
-}
-
-const TaskRelationSchema = Type.Object({
-  type: Type.String({ description: "Relationship type, e.g. parent, related, validates, supersedes, or orderAfter" }),
-  target: Type.String({ description: "Target task ID, or a create-batch key when used inside TaskCreate" }),
-});
-
-const TaskCreateItemSchema = Type.Object({
-  key: Type.Optional(Type.String({ description: "Temporary key for references within this TaskCreate call" })),
-  subject: Type.String({ description: "A brief title for the task" }),
-  description: Type.String({ description: "A detailed description of what needs to be done" }),
-  status: Type.Optional(Type.Unsafe<"pending" | "in_progress">({
-    type: "string",
-    enum: ["pending", "in_progress"],
-    description: "Initial task status. Defaults to pending; use in_progress for the task you are starting immediately.",
-  })),
-  activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in the spinner when in_progress" })),
-  agentType: Type.Optional(Type.String({ description: "Agent type for subagent execution" })),
-  metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
-  blocks: Type.Optional(Type.Array(Type.String(), { description: "Task IDs or create-batch keys this task blocks" })),
-  blockedBy: Type.Optional(Type.Array(Type.String(), { description: "Task IDs or create-batch keys that block this task" })),
-  relations: Type.Optional(Type.Array(TaskRelationSchema, { description: "Non-blocking task relationships" })),
-});
-
-const TaskUpdateItemSchema = Type.Object({
-  taskId: Type.String({ description: "The ID of the task to update" }),
-  status: Type.Optional(Type.Unsafe<"pending" | "in_progress" | "completed" | "deleted">({
-    type: "string",
-    enum: ["pending", "in_progress", "completed", "deleted"],
-    description: "New status for the task",
-  })),
-  subject: Type.Optional(Type.String({ description: "New subject for the task" })),
-  description: Type.Optional(Type.String({ description: "New description for the task" })),
-  activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in the spinner when in_progress" })),
-  owner: Type.Optional(Type.String({ description: "New owner for the task" })),
-  metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Metadata keys to merge into the task. Set a key to null to delete it." })),
-  addBlocks: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that this task blocks" })),
-  addBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that block this task" })),
-  setRelations: Type.Optional(Type.Array(TaskRelationSchema, { description: "Replace non-blocking relationships for this task" })),
-  addRelations: Type.Optional(Type.Array(TaskRelationSchema, { description: "Add non-blocking relationships to this task" })),
-  removeRelations: Type.Optional(Type.Array(TaskRelationSchema, { description: "Remove matching non-blocking relationships from this task" })),
-});
-
-type TaskCreateToolParams = { tasks?: TaskCreateInput[] } & Partial<TaskCreateInput>;
-type TaskUpdateToolParams = {
-  updates?: Array<TaskUpdateFields & { taskId: string }>;
-  taskId?: string;
-  includeList?: boolean;
-} & TaskUpdateFields;
-
-function normalizeTaskCreateParams(params: TaskCreateToolParams): TaskCreateInput[] {
-  if (Array.isArray(params.tasks)) return params.tasks;
-  if (typeof params.subject !== "string" || typeof params.description !== "string") return [];
-  const { tasks: _tasks, ...task } = params;
-  return [task as TaskCreateInput];
-}
-
-function normalizeTaskUpdateParams(params: TaskUpdateToolParams): Array<TaskUpdateFields & { taskId: string }> {
-  if (Array.isArray(params.updates)) return params.updates;
-  if (typeof params.taskId !== "string") return [];
-  const { updates: _updates, includeList: _includeList, ...update } = params;
-  return [update as TaskUpdateFields & { taskId: string }];
 }
 
 function formatRelations(relations: TaskRelation[]): string {
@@ -150,38 +98,116 @@ const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdat
 /** How many turns without task tool usage before injecting a reminder. */
 const REMINDER_INTERVAL = 4;
 
+/** Shorter interval used while any task is in_progress, so stale work is caught faster. */
+const ACTIVE_REMINDER_INTERVAL = 2;
+
+/** Cap on how many tasks the reminder echoes, to bound its size on large lists. */
+const REMINDER_MAX_TASKS = 10;
+
+/** Effective reminder interval for a given task list (pure — no disk I/O). */
+function intervalFor(tasks: Task[]): number {
+  return tasks.some(t => t.status === "in_progress") ? ACTIVE_REMINDER_INTERVAL : REMINDER_INTERVAL;
+}
+
 /** How many turns completed tasks linger before auto-clearing. */
 const AUTO_CLEAR_DELAY = 4;
 
-const SYSTEM_REMINDER = `<system-reminder>
-The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, consider using TaskCreate to add new tasks and TaskUpdate to update task status (set to in_progress when starting, completed when done). Also consider cleaning up the task list if it has become stale. Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. Make sure that you NEVER mention this reminder to the user
-</system-reminder>`;
+/** Neutralize a task field for the echo: collapse newlines and strip reminder tags. */
+function sanitizeField(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").replace(/<\/?system-reminder>/gi, "").trim();
+}
 
-export default function (pi: ExtensionAPI) {
-  // Initialize store and config
-  const cfg = loadTasksConfig();
-  const piTasks = process.env.PI_TASKS;
-  const taskScope = cfg.taskScope ?? "session";
-
-  /** Resolve the task store path from env/config (without session ID). */
-  function resolveStorePath(sessionId?: string): string | undefined {
-    if (piTasks === "off") return undefined;
-    if (piTasks?.startsWith("/")) return piTasks;
-    if (piTasks?.startsWith(".")) return resolve(piTasks);
-    if (piTasks) return piTasks;
-    if (taskScope === "memory") return undefined;
-    if (taskScope === "session" && sessionId) {
-      return join(process.cwd(), ".pi", "tasks", `tasks-${sessionId}.json`);
-    }
-    if (taskScope === "session") return undefined; // no session ID yet, start in-memory
-    return join(process.cwd(), ".pi", "tasks", "tasks.json");
+/**
+ * Build the system reminder, shaped after Claude Code's todo reminders: an
+ * empty-list nudge, or a state echo that dumps the current list as JSON. The
+ * wording mirrors Claude Code (adapted to this extension's task tool names).
+ */
+function buildSystemReminder(tasks: Task[]): string {
+  if (tasks.length === 0) {
+    return [
+      "<system-reminder>",
+      "This is a reminder that your task list is currently empty. DO NOT mention this to the user explicitly because they are already aware. If you are working on tasks that would benefit from a task list please use the TaskCreate tool to create one. If not, please feel free to ignore. Again do not mention this message to the user.",
+      "</system-reminder>",
+    ].join("\n");
   }
 
-  // For project scope (or env override), create store immediately.
-  // For session scope, start with in-memory and upgrade once we have the session ID.
-  let store = new TaskStore(resolveStorePath());
+  // Bound the echo on large lists. When over the cap, drop completed tasks
+  // first (the reminder exists to surface unfinished work); ties keep task
+  // order since Array.sort is stable.
+  let shown = tasks;
+  if (tasks.length > REMINDER_MAX_TASKS) {
+    const rank = (t: Task) => (t.status === "in_progress" ? 0 : t.status === "pending" ? 1 : 2);
+    shown = [...tasks].sort((a, b) => rank(a) - rank(b)).slice(0, REMINDER_MAX_TASKS);
+  }
+  const hidden = tasks.length - shown.length;
+  const overflow = hidden > 0
+    ? ` (${hidden} more task${hidden === 1 ? "" : "s"} not shown — use TaskList for the full list.)`
+    : "";
+
+  const items = shown.map(t => {
+    const item: Record<string, string> = {
+      id: t.id,
+      content: sanitizeField(t.subject),
+      status: t.status,
+    };
+    if (t.activeForm) item.activeForm = sanitizeField(t.activeForm);
+    return item;
+  });
+
+  // When truncated, don't claim these are the full contents.
+  const prefix = "The task tools haven't been used recently. DO NOT mention this explicitly to the user.";
+  const header = hidden > 0
+    ? `${prefix} Here are your most relevant tasks (list truncated):`
+    : `${prefix} Here are the latest contents of your task list:`;
+
+  return [
+    "<system-reminder>",
+    header,
+    "",
+    `${JSON.stringify(items)}.${overflow} Continue on with the tasks at hand if applicable.`,
+    "</system-reminder>",
+  ].join("\n");
+}
+
+export default function (pi: ExtensionAPI) {
+  // Project overrides require ExtensionContext.cwd, which is unavailable while
+  // the extension factory runs. Start with global defaults, then merge the
+  // active workspace's overrides on the first context-bearing event.
+  const cfg = loadGlobalTasksConfig();
+  const piTasks = process.env.PI_TASKS;
+  let taskScope = cfg.taskScope ?? "session";
+
+  /** Both session scopes persist one file per session; they differ only in where it
+   *  lives, so every lifecycle rule about session files applies to each of them. */
+  const isSessionScope = () => taskScope === "session" || taskScope === "session-global";
+
+  /** Resolve both the backing path and a stable identity for the active store. */
+  function resolveStoreTarget(cwd?: string, sessionId?: string): { key: string; path?: string } {
+    if (piTasks === "off") return { key: "memory:env" };
+    if (piTasks?.startsWith("/")) return { key: `path:${piTasks}`, path: piTasks };
+    if (piTasks?.startsWith(".")) {
+      const path = cwd ? resolve(cwd, piTasks) : undefined;
+      return path ? { key: `path:${path}`, path } : { key: "pending:relative" };
+    }
+    if (piTasks) return { key: `named:${piTasks}`, path: piTasks };
+    if (taskScope === "memory") return { key: "memory:config" };
+    if (!cwd) return { key: "pending:workspace" };
+    if (isSessionScope() && sessionId) {
+      const path = sessionTaskFile(cwd, sessionId, taskScope);
+      return { key: `path:${path}`, path };
+    }
+    if (isSessionScope()) return { key: "pending:session" };
+    const path = join(cwd, ".pi", "tasks", "tasks.json");
+    return { key: `path:${path}`, path };
+  }
+
+  // Project and relative paths need ExtensionContext.cwd, which is unavailable
+  // while the extension factory runs. Absolute and named PI_TASKS overrides can
+  // still be opened immediately; all other stores start in memory.
+  let storeTarget = resolveStoreTarget();
+  let store = new TaskStore(storeTarget.path);
   const tracker = new ProcessTracker();
-  const widget = new TaskWidget(store);
+  const widget = new TaskWidget(store, cfg);
 
   // ── Subagent integration state ──
   /** Latest ExtensionContext — refreshed on every tool execution so cascade always has a valid one. */
@@ -230,6 +256,17 @@ export default function (pi: ExtensionAPI) {
   /** Stop a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension). */
   function stopSubagent(agentId: string): Promise<void> {
     return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
+  }
+
+  /** Tell subagents its result has been handed to the model, which suppresses the
+   *  completion notification it would otherwise deliver for the same result — the
+   *  same consumption `get_subagent_result` performs when it returns one.
+   *
+   *  Fire-and-forget rather than an `rpcCall`: the reply carries nothing to act on,
+   *  and the channel is deliberately outside the version handshake so a pi-subagents
+   *  without the handler keeps notifying instead of failing the read. */
+  function consumeSubagentResult(agentId: string): void {
+    pi.events.emit("subagents:rpc:consume", { requestId: randomUUID(), agentId });
   }
 
   // ── Subagent extension presence & version detection ──
@@ -336,11 +373,11 @@ export default function (pi: ExtensionAPI) {
           store.update(next.id, { owner: agentId, metadata: { ...next.metadata, agentId } });
           widget.setActiveTask(next.id);
         } catch (err: any) {
-          store.update(next.id, { status: "pending", metadata: { ...next.metadata, lastError: err.message } });
+          store.update(next.id, { status: "pending", metadata: { ...next.metadata, result: null, lastError: err.message } });
         }
       }
     }
-    autoClear.trackCompletion(task.id, currentTurn);
+    autoClear.trackCompletion(task.id, cadence.currentTurn);
     widget.update();
   });
 
@@ -357,31 +394,84 @@ export default function (pi: ExtensionAPI) {
     if (status === "stopped") {
       // Intentional stop — mark completed, preserve partial result
       store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: result || task.metadata?.result } });
-      autoClear.trackCompletion(task.id, currentTurn);
+      autoClear.trackCompletion(task.id, cadence.currentTurn);
     } else {
-      // Actual error — revert to pending
-      store.update(task.id, { status: "pending", metadata: { ...task.metadata, lastError: error || status } });
+      // Actual error — revert to pending. `result: null` drops it (the store deletes
+      // a key set to null): a task back to pending has no current result, and an
+      // earlier run's would otherwise outrank this error everywhere it is read.
+      store.update(task.id, { status: "pending", metadata: { ...task.metadata, result: null, lastError: error || status } });
       autoClear.resetBatchCountdown();
     }
     widget.setActiveTask(task.id, false);
     widget.update();
   });
 
-  // ── Session-scoped store upgrade ──
-  // For session scope, the store starts in-memory (no session ID at init time).
-  // Upgrade to file-backed on first context arrival (turn_start, before_agent_start,
-  // or tool_execution_start — whichever fires first).
-  let storeUpgraded = false;
+  // ── Context-scoped store initialization ──
+  // Project paths cannot be resolved until an ExtensionContext is available.
+  // Initialize on the first context-bearing event and reinitialize when a host
+  // switches this extension instance to a session in another workspace.
+  let configuredCwd: string | undefined;
   let persistedTasksShown = false;
-  function upgradeStoreIfNeeded(ctx: ExtensionContext) {
-    if (storeUpgraded) return;
-    if (taskScope === "session" && !piTasks) {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const path = resolveStorePath(sessionId);
-      store = new TaskStore(path);
-      widget.setStore(store);
+  let agentsReattached = false;
+  function initializeStoreForContext(ctx: ExtensionContext, reloadConfig = false) {
+    // Keep the config object identity stable because the widget and auto-clear
+    // manager retain references to it, but replace every value so overrides
+    // from a previous workspace cannot leak into the next one.
+    if (reloadConfig || configuredCwd !== ctx.cwd) {
+      for (const key of Object.keys(cfg) as (keyof typeof cfg)[]) delete cfg[key];
+      Object.assign(cfg, loadTasksConfig(ctx.cwd));
+      taskScope = cfg.taskScope ?? "session";
     }
-    storeUpgraded = true;
+
+    // `pi --no-session` mints a session ID but never a session file. Keying off the
+    // ID alone would write tasks-<id>.json for a session that can never be resumed
+    // and is orphaned the moment pi exits: if pi is not persisting the conversation,
+    // don't persist the task list either.
+    const sessionId = isSessionScope() && !piTasks && ctx.sessionManager.getSessionFile()
+      ? ctx.sessionManager.getSessionId()
+      : undefined;
+    const nextTarget = resolveStoreTarget(ctx.cwd, sessionId);
+    if (nextTarget.key !== storeTarget.key) {
+      store = new TaskStore(nextTarget.path);
+      widget.setStore(store);
+      storeTarget = nextTarget;
+      // The new store owns a different task list, so the agent map has to be
+      // rebuilt from it rather than kept from the previous one.
+      agentsReattached = false;
+    }
+    configuredCwd = ctx.cwd;
+  }
+
+  /** Delete an emptied session file, and — under `session-global` only — the
+   *  directory that held it once its last session is gone. Nothing else is ours
+   *  to reclaim: a PI_TASKS path can point anywhere, and `<workspace>/.pi/tasks/`
+   *  is left standing exactly as it always has been. */
+  function deleteSessionFileIfEmpty() {
+    if (piTasks || !isSessionScope()) return;
+    if (!store.deleteFileIfEmpty()) return;
+    if (taskScope === "session-global" && !piTasks && configuredCwd) {
+      reclaimGlobalSessionTasksDir(configuredCwd);
+    }
+  }
+
+  /** Re-link persisted in-progress tasks to the subagents still running for them.
+   *  `agentTaskMap` lives only in this extension instance, so a reload starts empty
+   *  while the agents keep going — their completion events would then be dropped and
+   *  the tasks would stay in_progress forever. Everything needed is already on disk:
+   *  TaskExecute records the agent ID in task metadata.
+   *
+   *  Only in_progress tasks are relinked. A task reverted to pending keeps its
+   *  `metadata.agentId`, and relinking that would let a late event resurrect work the
+   *  user has already reset. Only runs once — the first caller wins. */
+  function reattachAgents() {
+    if (agentsReattached) return;
+    agentsReattached = true;
+    for (const task of store.list()) {
+      const agentId = task.metadata?.agentId;
+      if (task.status === "in_progress" && typeof agentId === "string" && agentId) {
+        agentTaskMap.set(agentId, task.id);
+      }
+    }
   }
 
   /** Restore widget on session start/resume if there's unfinished work.
@@ -395,7 +485,7 @@ export default function (pi: ExtensionAPI) {
     if (tasks.length > 0) {
       if (!isResume && tasks.every(t => t.status === "completed")) {
         store.clearCompleted();
-        if (taskScope === "session") store.deleteFileIfEmpty();
+        if (isSessionScope()) deleteSessionFileIfEmpty();
       } else {
         widget.update();
       }
@@ -403,72 +493,173 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ── Turn tracking for system-reminder injection ──
-  let currentTurn = 0;
-  let lastTaskToolUseTurn = 0;
-  let reminderInjectedThisCycle = false;
+  // Cadence decisions live in `reminder-cadence.ts` so they're
+  // unit-testable without spinning up a fake ExtensionAPI.
+  const cadence = createCadenceState();
+  const cadenceConfig: CadenceConfig = {
+    reminderInterval: REMINDER_INTERVAL,
+    taskToolNames: TASK_TOOL_NAMES,
+  };
 
   pi.on("turn_start", async (_event, ctx) => {
-    currentTurn++;
+    onTurnStart(cadence);
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
-    if (autoClear.onTurnStart(currentTurn)) widget.update();
+    initializeStoreForContext(ctx);
+    if (autoClear.onTurnStart(cadence.currentTurn)) {
+      if (isSessionScope()) deleteSessionFileIfEmpty();
+      widget.update();
+    }
   });
 
-  pi.on("input", async (event: any) => {
+  pi.on("input", async (event) => {
     if (event?.source !== "extension") resetStopHookPrompt(stopHookState);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx);
     showPersistedTasks();
-    maybePromptForOpenTasks(pi as any, ctx, store.list(), stopHookState);
+    maybePromptForOpenTasks(pi, ctx, store.list(), stopHookState);
   });
 
-  // ── Token usage tracking ──
+  // The end of a run is the only signal that separates a new batch of tasks from the
+  // same batch still being built — the store looks identical either way. Nothing is
+  // cleared here; this only marks the boundary for the next TaskCreate.
+  pi.on("agent_settled", async () => {
+    autoClear.onRunEnded();
+  });
+
+  // ── Token usage tracking + stale-task detection ──
   // Feed per-turn token counts from assistant messages into the widget.
+  // Also detect when the agent has stopped referencing tasks but left
+  // them in_progress — schedule a reminder for the next LLM call.
   pi.on("turn_end", async (event) => {
     const msg = event.message as any;
     if (msg?.role === "assistant" && msg.usage) {
       widget.addTokenUsage(msg.usage.input ?? 0, msg.usage.output ?? 0);
     }
+
+    // Stale-task detection: catch the case where the agent finishes work in a
+    // text-only turn (no tool calls, so tool_result never fires) but left tasks
+    // in_progress. Cheap-first: only read the store once the turn gap could
+    // matter — the in_progress interval is the smallest a reminder can need.
+    if (!cadence.reminderInjectedThisCycle && !cadence.reminderDue) {
+      const gap = cadence.currentTurn - cadence.lastTaskToolUseTurn;
+      if (gap >= ACTIVE_REMINDER_INTERVAL && store.list().some(t => t.status === "in_progress")) {
+        cadence.reminderDue = true;
+      }
+    }
   });
 
-  // ── System-reminder injection via tool_result event ──
-  // Appends a <system-reminder> nudge to non-task tool results when tasks exist
-  // but task tools haven't been used recently (mimics Claude Code's behavior).
+  // ── System-reminder injection ──
+  //
+  // tool_result is used ONLY to track cadence. We DO NOT mutate non-task
+  // tool result content — appending a <system-reminder> there would
+  // corrupt model-visible transcript semantics for unrelated tools (read,
+  // bash, grep, …) and make tool-output debugging miserable.
+  //
+  // The actual injection happens in the `context` hook below, which fires
+  // before each LLM call and returns a modified copy of the messages
+  // without persisting or polluting any tool output.
   pi.on("tool_result", async (event) => {
-    // Task tool usage resets the reminder timer
+    // Task tool usage resets cadence (interval is irrelevant on this path — the
+    // helper resets and returns before reading it).
     if (TASK_TOOL_NAMES.has(event.toolName)) {
-      lastTaskToolUseTurn = currentTurn;
-      reminderInjectedThisCycle = false;
+      evaluateToolResult(cadence, event.toolName, false, cadenceConfig);
       return {};
     }
 
-    // Cheap checks first — avoid store.list() disk I/O when possible
-    if (currentTurn - lastTaskToolUseTurn < REMINDER_INTERVAL) return {};
-    if (reminderInjectedThisCycle) return {};
+    if (cadence.reminderInjectedThisCycle) return {};
+    // Cheap-first: avoid store.list() disk I/O until the turn gap could matter.
+    // ACTIVE_REMINDER_INTERVAL is the smallest interval any reminder can need.
+    if (cadence.currentTurn - cadence.lastTaskToolUseTurn < ACTIVE_REMINDER_INTERVAL) return {};
 
     const tasks = store.list();
-    if (tasks.length === 0) return {};
+    // Shorter interval while in_progress; passed per-call so the shared config
+    // is never mutated.
+    evaluateToolResult(cadence, event.toolName, tasks.length > 0, {
+      ...cadenceConfig,
+      reminderInterval: intervalFor(tasks),
+    });
+    return {};
+  });
 
-    // Append system-reminder to tool result content.
-    // Reset the baseline so the next reminder fires REMINDER_INTERVAL turns later.
-    reminderInjectedThisCycle = true;
-    lastTaskToolUseTurn = currentTurn;
+  // Inject the transient system-reminder into the upcoming LLM call's
+  // messages, never into a tool result. The reminder is appended as a
+  // user message so models that don't support custom message types still
+  // receive it. It is not persisted in the session store — `context`
+  // returns a transformed messages array used only for this one request.
+  pi.on("context", async (event) => {
+    if (!drainReminderForContext(cadence)) return {};
+    const tasks = store.list();
+
     return {
-      content: [...event.content, { type: "text" as const, text: SYSTEM_REMINDER }],
+      messages: [
+        ...event.messages,
+        {
+          role: "user" as const,
+          content: [{ type: "text" as const, text: buildSystemReminder(tasks) }],
+          timestamp: Date.now(),
+        },
+      ],
     };
   });
 
-  // Grab UI context early — before_agent_start fires before any tool calls,
-  // so persisted tasks show up immediately on session start.
+  // session_start replaces the never-emitted session_switch event. Rehydrating
+  // here matters because before_agent_start only fires once the user prompts.
+  pi.on("session_start", async (event, ctx) => {
+    latestCtx = ctx;
+    widget.setUICtx(ctx.ui as UICtx);
+
+    const reason = event.reason;
+    // new/resume/fork reuse the running extension instance (getExtensions() is
+    // cached), so session-scoped state must be reset. startup/reload re-run the
+    // factory and start clean.
+    const isSwitch = reason === "new" || reason === "resume" || reason === "fork";
+    // A fork branches the conversation, so its tasks carry over as an independent
+    // copy. Snapshot before the store re-points to the new (empty) session file.
+    const forkSeed = reason === "fork" ? store.snapshot() : undefined;
+    if (isSwitch) {
+      persistedTasksShown = false;
+      agentsReattached = false;
+      // Task IDs restart at 1 in every session, so a mapping held over from the
+      // previous one points at an unrelated task here — the agent's completion would
+      // close a task it never ran. reattachAgents() rebuilds what this session owns.
+      agentTaskMap.clear();
+      resetCadenceState(cadence);
+      resetStopHookPrompt(stopHookState);
+      autoClear.reset();
+      // Memory mode has no file to switch — clear tasks explicitly on /new.
+      if (reason === "new" && taskScope === "memory") {
+        store.clearAll();
+      }
+    }
+
+    initializeStoreForContext(ctx, true);
+    if (forkSeed?.tasks.length) store.seed(forkSeed); // carry the parent's tasks into the fork
+    reattachAgents(); // subagents outlive a reload; relink them before events arrive
+    // resume/reload/fork keep tasks; startup/new auto-clear an all-completed list.
+    const keepsTasks = reason === "reload" || reason === "resume" || reason === "fork";
+    showPersistedTasks(keepsTasks);
+    // Those tasks are shown for review, but the run that produced them ended with the
+    // session before this one — so the next batch must not be added to them either.
+    if (keepsTasks) autoClear.onRunEnded();
+
+    if (pendingWarning) {
+      ctx.ui.notify(pendingWarning, "warning");
+      pendingWarning = undefined;
+    }
+  });
+
+  // Fallback for hosts that init UI lazily. Guarded by persistedTasksShown, so
+  // it never double-renders after session_start.
   pi.on("before_agent_start", async (event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx);
+    reattachAgents();
     showPersistedTasks();
     if (pendingWarning) {
       ctx.ui.notify(pendingWarning, "warning");
@@ -478,121 +669,24 @@ export default function (pi: ExtensionAPI) {
     if (stopHookPrompt) return { systemPrompt: `${event.systemPrompt}\n\n${stopHookPrompt}` };
   });
 
-  // session_switch fires on /new (reason: "new") and /resume (reason: "resume").
-  // On /new: reset all session-scoped state so the store switches to the new session file.
-  // On resume: reload persisted tasks from the existing session file.
-  pi.on("session_switch" as any, async (event: any, ctx: ExtensionContext) => {
-    latestCtx = ctx;
-    widget.setUICtx(ctx.ui as UICtx);
-
-    const isResume = event?.reason === "resume";
-
-    // Reset session-scoped state for both /new and /resume
-    storeUpgraded = false;
-    persistedTasksShown = false;
-    currentTurn = 0;
-    lastTaskToolUseTurn = 0;
-    reminderInjectedThisCycle = false;
-    autoClear.reset();
-
-    // Memory mode has no file-backed store to switch — clear explicitly on /new
-    if (!isResume && taskScope === "memory") {
-      store.clearAll();
-    }
-
-    upgradeStoreIfNeeded(ctx);
-    showPersistedTasks(isResume);
-  });
-
   // Keep latestCtx fresh on every tool execution as well.
   pi.on("tool_execution_start", async (_event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
-    upgradeStoreIfNeeded(ctx);
+    initializeStoreForContext(ctx);
     widget.update();
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 1: TaskCreate
+  // Batch mutations
   // ──────────────────────────────────────────────────
 
-  pi.registerTool({
-    name: "TaskCreate",
-    label: "TaskCreate",
-    description: `Use this tool to create one or more structured tasks for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
-It also helps the user understand the progress of the task and overall progress of their requests.
-
-## When to Use This Tool
-
-Use this tool proactively in these scenarios:
-
-- Complex multi-step tasks - When a task requires 3 or more distinct steps or actions
-- Non-trivial and complex tasks - Tasks that require careful planning or multiple operations
-- Plan mode - When using plan mode, create a task list to track the work
-- User explicitly requests todo list - When the user directly asks you to use the todo list
-- User provides multiple tasks - Create the visible task set in one call
-- After receiving new instructions - Immediately capture user requirements as tasks
-- After completing a task - Add any newly discovered follow-up tasks
-
-## When NOT to Use This Tool
-
-Skip using this tool when:
-- There is only a single, straightforward task
-- The task is trivial and tracking it provides no organizational benefit
-- The task can be completed in less than 3 trivial steps
-- The task is purely conversational or informational
-
-NOTE that you should not use this tool if there is only one trivial task to do. In this case you are better off just doing the task directly.
-
-## Parameters
-
-Pass \`tasks\`, an array of task objects. Use one element for a single task.
-
-Each task supports:
-- **key**: Temporary key for references inside this create call
-- **subject**: A brief, actionable title in imperative form
-- **description**: Detailed context and acceptance criteria
-- **status**: Optional initial status, \`pending\` or \`in_progress\`; use \`in_progress\` for the task you are starting immediately
-- **activeForm**: Present continuous form shown in the spinner when in_progress
-- **agentType**: Agent type for subagent execution via TaskExecute
-- **metadata**: Arbitrary metadata
-- **blocks** / **blockedBy**: Hard dependencies using task IDs or keys from this call
-- **relations**: Non-blocking relationships, e.g. \`parent\`, \`related\`, \`validates\`, \`supersedes\`, or \`orderAfter\`
-
-Tasks default to status \`pending\`. Set \`status: "in_progress"\` on the task you are starting immediately to avoid a follow-up TaskUpdate call.
-
-## Tips
-
-- Create small, scan-friendly task sets instead of many separate tool calls
-- Use \`key\` plus \`blockedBy\` to create tasks and their hard dependencies atomically
-- Use \`relations\` for structure that should not block execution
-- Check TaskList first to avoid creating duplicate tasks`,
-    promptGuidelines: [
-      "When working on complex multi-step tasks, use TaskCreate to track progress and TaskUpdate to update status.",
-      "Mark tasks as in_progress before starting work and completed when done.",
-      "Use TaskList to check for available work after completing a task.",
-    ],
-    parameters: Type.Object({
-      tasks: Type.Array(TaskCreateItemSchema, { description: "Tasks to create. Use one element for a single task.", minItems: 1 }),
-    }),
-
-    execute(_toolCallId, params: TaskCreateToolParams, _signal, _onUpdate, _ctx) {
-      const inputs = normalizeTaskCreateParams(params);
-      if (inputs.length === 0) return Promise.resolve(textResult("No tasks provided"));
-
-      autoClear.resetBatchCountdown();
-      const { tasks, warnings } = store.createMany(inputs);
-      for (const task of tasks) {
-        if (task.status === "in_progress") widget.setActiveTask(task.id);
-      }
-      widget.update();
-
-      const lines = tasks.length === 1
-        ? [`Task #${tasks[0].id} created successfully: ${tasks[0].subject}`]
-        : [`Created ${tasks.length} tasks:`, ...tasks.map(task => `#${task.id} ${task.subject}`)];
-      if (warnings.length > 0) lines.push(`Warnings: ${warnings.join("; ")}`);
-      return Promise.resolve(textResult(lines.join("\n")));
-    },
+  registerTaskMutationTools(pi, {
+    getStore: () => store,
+    widget,
+    autoClear,
+    getCurrentTurn: () => cadence.currentTurn,
+    formatTaskList,
   });
 
   // ──────────────────────────────────────────────────
@@ -727,127 +821,6 @@ Returns full task details:
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 4: TaskUpdate
-  // ──────────────────────────────────────────────────
-
-  pi.registerTool({
-    name: "TaskUpdate",
-    label: "TaskUpdate",
-    description: `Use this tool to update one or more tasks in the task list.
-
-## When to Use This Tool
-
-**Before starting work on a task:**
-- Mark it in_progress BEFORE beginning — do not start work without updating status first
-- Set top-level \`includeList: true\` when you need the updated task summary immediately after the mutation
-
-**Mark tasks as resolved:**
-- When you have completed the work described in a task
-- When a task is no longer needed or has been superseded
-- IMPORTANT: Always mark your assigned tasks as resolved when you finish them
-- After resolving, use \`includeList: true\` when you need the updated list or next available task
-
-- ONLY mark a task as completed when you have FULLY accomplished it
-- If you encounter errors, blockers, or cannot finish, keep it as in_progress
-- Never mark a task as completed if tests are failing, implementation is partial, or unresolved errors remain
-
-**Delete tasks:**
-- Include an update with \`status: "deleted"\` to permanently remove that task
-- Deleting a task cleans hard dependency edges and non-blocking relationships pointing to it
-
-**Update task details and relationships:**
-- Use \`updates\`, an array of update objects. Use one element for a single task.
-- Set top-level \`includeList: true\` to append the post-update TaskList summary when you would otherwise call TaskList immediately afterward.
-- \`addBlocks\` and \`addBlockedBy\` are hard blocking dependencies and affect availability.
-- \`setRelations\`, \`addRelations\`, and \`removeRelations\` manage non-blocking structure such as \`parent\`, \`related\`, \`validates\`, \`supersedes\`, and \`orderAfter\`.
-
-## Fields You Can Update
-
-- **taskId**: Task to update
-- **status**: \`pending\`, \`in_progress\`, \`completed\`, or \`deleted\`
-- **subject**, **description**, **activeForm**, **owner**
-- **metadata**: Shallow merge; set a key to null to delete it
-- **addBlocks** / **addBlockedBy**: Hard dependencies
-- **setRelations** / **addRelations** / **removeRelations**: Non-blocking relationships
-
-## Additional Options
-
-- **includeList**: Optional top-level boolean. When true, append the post-mutation task list summary to avoid a separate TaskList call.
-
-## Examples
-
-Mark one task as in progress:
-\`\`\`json
-{"updates": [{"taskId": "1", "status": "in_progress"}]}
-\`\`\`
-
-Complete and delete tasks together:
-\`\`\`json
-{"updates": [{"taskId": "1", "status": "completed"}, {"taskId": "2", "status": "deleted"}]}
-\`\`\`
-
-Add a soft ordering relationship:
-\`\`\`json
-{"updates": [{"taskId": "3", "addRelations": [{"type": "orderAfter", "target": "1"}]}]}
-\`\`\`
-
-Complete a task and include the updated list:
-\`\`\`json
-{"updates": [{"taskId": "1", "status": "completed"}], "includeList": true}
-\`\`\``,
-    parameters: Type.Object({
-      updates: Type.Array(TaskUpdateItemSchema, { description: "Task updates to apply. Use one element for a single task.", minItems: 1 }),
-      includeList: Type.Optional(Type.Boolean({ description: "Append the post-update TaskList summary to avoid a separate TaskList call" })),
-    }),
-
-    execute(_toolCallId, params: TaskUpdateToolParams, _signal, _onUpdate, _ctx) {
-      const updates = normalizeTaskUpdateParams(params);
-      if (updates.length === 0) return Promise.resolve(textResult("No task updates provided"));
-
-      const { results, warnings } = store.updateMany(updates);
-      const lines: string[] = [];
-
-      for (let i = 0; i < updates.length; i++) {
-        const update = updates[i];
-        const result = results[i];
-        if (!result || (result.changedFields.length === 0 && !result.task)) {
-          lines.push(`Task #${update.taskId} not found`);
-          continue;
-        }
-
-        if (update.status === "in_progress") {
-          widget.setActiveTask(update.taskId);
-          autoClear.resetBatchCountdown();
-        } else if (update.status === "pending") {
-          autoClear.resetBatchCountdown();
-        } else if (update.status === "completed" || update.status === "deleted") {
-          widget.setActiveTask(update.taskId, false);
-          if (update.status === "completed") autoClear.trackCompletion(update.taskId, currentTurn);
-        }
-
-        lines.push(`Updated task #${update.taskId} ${result.changedFields.join(", ")}`);
-      }
-
-      if (warnings.length > 0) lines.push(`Warnings: ${warnings.join("; ")}`);
-      if (updates.some(update => update.status === "completed" || update.status === "deleted")) {
-        const hierarchy = buildTaskHierarchy(store.list());
-        const readyParents = getReadyParentIds(hierarchy);
-        if (readyParents.length > 0) {
-          lines.push(`Ready to complete: ${readyParents.map(id => {
-            const summary = getSubtaskSummary(id, hierarchy);
-            return `#${id} (${summary.completed}/${summary.total} subtasks done)`;
-          }).join(", ")}`);
-        }
-      }
-      if (params.includeList) {
-        lines.push("", "Task list:", formatTaskList(store.list()));
-      }
-      widget.update();
-      return Promise.resolve(textResult(lines.join("\n")));
-    },
-  });
-
-  // ──────────────────────────────────────────────────
   // Tool 5: TaskOutput
   // ──────────────────────────────────────────────────
 
@@ -869,6 +842,9 @@ Complete a task and include the updated list:
 
     async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
       const { task_id, block, timeout } = params;
+      // Reject an empty id up front: every agent ID starts with "", so the prefix
+      // match below would resolve it to whichever agent the map yields first.
+      if (!task_id) throw new Error("task_id is required");
 
       const processOutput = tracker.getOutput(task_id);
       if (!processOutput) {
@@ -896,14 +872,29 @@ Complete a task and include the updated list:
               const unsubFail = pi.events.on("subagents:failed", (d: unknown) => {
                 if ((d as any).id === task.metadata?.agentId) { unsubOk(); unsubFail(); cleanup(); }
               });
-              // Re-check in case status changed between the outer check and listener registration
-              const current = store.get(task_id);
+              // Re-read before committing to the wait. Nothing awaits since the outer
+              // check, so this only differs on a shared file-backed list, where
+              // store.get() reloads and another session may have finished the task.
+              const current = store.get(resolvedId);
               if (current && current.status !== "in_progress") { unsubOk(); unsubFail(); cleanup(); }
               signal?.addEventListener("abort", () => { unsubOk(); unsubFail(); cleanup(); }, { once: true });
             });
           }
-          const updated = store.get(task_id) ?? task;
-          return textResult(`Task #${task_id} [${updated.status}] — subagent ${task.metadata.agentId}`);
+          // Re-read by resolved ID — `task` predates the wait, and a file-backed
+          // store deserializes a fresh object on every load, so it is stale here.
+          const updated = store.get(resolvedId) ?? task;
+          const agentId: string = task.metadata.agentId;
+          // Consume only what is actually handed over: the agent has reported back
+          // (it leaves the map when it does) and the task carries its outcome. Short
+          // of both — still running, or an update that never landed — the model is
+          // getting a status, and the notification pi-subagents is holding is the
+          // only thing that will announce the result.
+          if (!agentTaskMap.has(agentId) && updated.status !== "in_progress") consumeSubagentResult(agentId);
+          const output = updated.metadata?.result
+            ?? (updated.metadata?.lastError ? `Error: ${updated.metadata.lastError}` : undefined);
+          return textResult(
+            `Task #${resolvedId} [${updated.status}] — subagent ${agentId}${output ? `\n\n${output}` : ""}`,
+          );
         }
         throw new Error(`No background process for task ${task_id}`);
       }
@@ -956,18 +947,18 @@ Complete a task and include the updated list:
         }
         const task = store.get(resolvedId);
         if (task?.metadata?.agentId && task.status === "in_progress") {
-          store.update(taskId, { status: "completed" });
-          autoClear.trackCompletion(taskId, currentTurn);
+          store.update(resolvedId, { status: "completed" });
+          autoClear.trackCompletion(resolvedId, cadence.currentTurn);
           await stopSubagent(task.metadata.agentId);
-          widget.setActiveTask(taskId, false);
+          widget.setActiveTask(resolvedId, false);
           widget.update();
-          return textResult(`Task #${taskId} stopped successfully`);
+          return textResult(`Task #${resolvedId} stopped successfully`);
         }
         throw new Error(`No running background process for task ${taskId}`);
       }
 
       store.update(taskId, { status: "completed" });
-      autoClear.trackCompletion(taskId, currentTurn);
+      autoClear.trackCompletion(taskId, cadence.currentTurn);
       widget.setActiveTask(taskId, false);
       widget.update();
       return textResult(`Task #${taskId} stopped successfully`);
@@ -1008,8 +999,9 @@ Complete a task and include the updated list:
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       if (!subagentsAvailable) {
         return textResult(
-          "Subagent execution is currently unavailable. " +
-          "Ensure the @tintinweb/pi-subagents extension is loaded and try again."
+          "Subagent execution is currently unavailable (@tintinweb/pi-subagents not loaded " +
+          "or version mismatch). You can run these as plain Agent-tool spawns, but pi-tasks " +
+          "won't track them — status stays pending, cascade won't fire, TaskOutput stays empty."
         );
       }
 
@@ -1034,7 +1026,7 @@ Complete a task and include the updated list:
         // Check all blockers are completed
         const openBlockers = task.blockedBy.filter(bid => {
           const blocker = store.get(bid);
-          return !blocker || blocker.status !== "completed";
+          return blocker?.status !== "completed";
         });
         if (openBlockers.length > 0) {
           results.push(`#${taskId}: blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
@@ -1092,6 +1084,9 @@ Complete a task and include the updated list:
   pi.registerCommand("tasks", {
     description: "Manage tasks — view, create, clear completed",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      latestCtx = ctx;
+      widget.setUICtx(ctx.ui as UICtx);
+      initializeStoreForContext(ctx);
       const ui = ctx.ui;
 
       const mainMenu = async (): Promise<void> => {
@@ -1118,12 +1113,12 @@ Complete a task and include the updated list:
           await settingsMenu();
         } else if (choice.startsWith("Clear completed")) {
           store.clearCompleted();
-          if (taskScope === "session") store.deleteFileIfEmpty();
+          if (isSessionScope()) deleteSessionFileIfEmpty();
           widget.update();
           await mainMenu();
         } else if (choice.startsWith("Clear all")) {
           store.clearAll();
-          if (taskScope === "session") store.deleteFileIfEmpty();
+          if (isSessionScope()) deleteSessionFileIfEmpty();
           widget.update();
           await mainMenu();
         }
@@ -1136,25 +1131,27 @@ Complete a task and include the updated list:
           return mainMenu();
         }
 
-        const statusIcon = (status: string) => {
+        const glyphs = resolveTaskGlyphs(cfg.glyphs);
+        const statusGlyph = (status: string) => {
           switch (status) {
-            case "completed": return "✔";
-            case "in_progress": return "◼";
-            default: return "◻";
+            case "completed": return glyphs.completed;
+            case "in_progress": return glyphs.inProgress;
+            default: return glyphs.pending;
           }
         };
 
         const choices = tasks.map(t =>
-          `${statusIcon(t.status)} #${t.id} [${t.status}] ${t.subject}`
+          `${statusGlyph(t.status)} #${t.id} [${t.status}] ${t.subject}`
         );
         choices.push("← Back");
 
         const selected = await ui.select("Tasks", choices);
         if (!selected || selected === "← Back") return mainMenu();
 
-        // Extract task ID from selection
-        const match = selected.match(/#(\d+)/);
-        if (match) await viewTaskDetail(match[1]);
+        // Matched by row position rather than parsed out of the label: both the glyph
+        // and the subject are free text, and either can contain something like "#42".
+        const picked = tasks[choices.indexOf(selected)];
+        if (picked) await viewTaskDetail(picked.id);
         else return viewTasks();
       };
 
@@ -1183,7 +1180,7 @@ Complete a task and include the updated list:
           return viewTasks();
         } else if (action === "✓ Complete") {
           store.update(taskId, { status: "completed" });
-          autoClear.trackCompletion(taskId, currentTurn);
+          autoClear.trackCompletion(taskId, cadence.currentTurn);
           widget.setActiveTask(taskId, false);
           widget.update();
           return viewTasks();
@@ -1197,7 +1194,7 @@ Complete a task and include the updated list:
       };
 
       const settingsMenu = (): Promise<void> =>
-        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY);
+        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY, ctx.cwd);
 
       const createTask = async (): Promise<void> => {
         const subject = await ui.input("Task subject");

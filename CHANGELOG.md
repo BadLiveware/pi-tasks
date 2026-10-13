@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-24
+
+### Added
+- **`taskScope: "session-global"` — per-session tasks kept outside the workspace.** Session scope writes `.pi/tasks/tasks-<sessionId>.json` into the workspace, so every repository pi runs in picks up an untracked directory holding a file keyed by a session ID: data of no use to anyone else cloning it, and one more `.gitignore` rule per project. The new scope keeps the same per-session isolation but stores the file at `<agent-dir>/tasks/sessions/<project-key>/tasks-<sessionId>.json` (`~/.pi/agent/tasks/…` by default, following pi's configured agent path like every other piece of user-level state), where `<project-key>` encodes the workspace path the way pi encodes it for its own session logs (`--Users-me-work-repo--`), so a project's tasks sit under the same name as its transcripts and same-ID sessions in different workspaces stay apart.
+
+  **`session` remains the default and is unchanged** — upgrading moves nothing. Opting in is non-destructive too: it only changes where *new* session files are created, and a session that already has a file in `<workspace>/.pi/tasks/` keeps using it, so switching back strands nothing. ([#61](https://github.com/tintinweb/pi-tasks/pull/61) — thanks [@kunaaal13](https://github.com/kunaaal13) — for [#53](https://github.com/tintinweb/pi-tasks/issues/53) — thanks [@rfgamaral](https://github.com/rfgamaral) — and [#57](https://github.com/tintinweb/pi-tasks/issues/57))
+
+- **Every glyph the widget draws is configurable.** A `glyphs` map in `tasks-config.json` at either scope replaces the status marks (`✔` / `◼` / `◻`), the active-task spinner frames, and the widget's furniture — header bullet, overflow and clipping markers, blocked-by marker, token arrows, stats separator, active-row ellipsis, and the glyph on the collapsed `N completed` line. Enough to run the widget in pure ASCII on a terminal without a Nerd Font, or in a set of your own. Every key is optional and falls back on its own, so a partial or malformed map still leaves every task marked, and glyphs merge per key across the global and project files rather than as a block. Glyphs are the first config value to reach the terminal as free text, so control characters and bidi overrides are rejected per glyph — a `.pi/tasks-config.json` arriving with a cloned repository cannot retitle your window or break a widget line in two. Config file only, not in `/tasks` → Settings. See [CUSTOMIZING.md](CUSTOMIZING.md#task-glyphs). ([#60](https://github.com/tintinweb/pi-tasks/pull/60) — thanks [@ningw42](https://github.com/ningw42))
+
+### Changed
+- **`TaskCreate` is told how to create a batch in one turn.** Its description now says that several tasks are created by issuing one `TaskCreate` call per task in a single response — pi runs independent tool calls in parallel — rather than leaving the model to serialize them across turns. No schema change: `subject` and `description` stay required, and there is no batch parameter to get wrong. ([#58](https://github.com/tintinweb/pi-tasks/pull/58) — thanks [@elecnix](https://github.com/elecnix))
+
+### Fixed
+- **`TaskOutput` returns a finished subagent's result, and dismisses its completion notification.** It reported only `Task #N [status] — subagent <id>`, so a model that had just blocked on the join still had to call `TaskGet` to read what the agent produced — and pi-subagents, never told the result had been read, delivered its completion notification anyway, after the parent had already answered, costing another turn. The result (or the error) now comes back under the status line, and handing it over consumes it through the new `subagents:rpc:consume` RPC. The suppression half needs a pi-subagents that answers that channel; one that does not keeps notifying rather than failing, and an agent that is still running is never consumed — its notification is the only thing that will announce it. ([#62](https://github.com/tintinweb/pi-tasks/issues/62) — thanks [@felipe3dfx](https://github.com/felipe3dfx))
+- **A failed subagent run no longer leaves the previous run's result behind.** The failure listener recorded `lastError` and reverted the task to `pending` but kept `metadata.result` from an earlier successful run, so a retry that failed carried both — and every reader had to guess which was current. A task back to `pending` now has no result, which is what `TaskOutput`, `TaskGet` and a cascaded agent's injected prerequisite output all already assumed. An intentional stop still keeps its partial result: that task is completed, not retried.
+- **The test suite no longer reads or writes the real `~/.pi/`.** Shared named lists and the global `tasks-config.json` both resolve from the home directory, so the suite left files in the home directory of whoever ran it and picked up their global settings. `HOME` now points at a scratch directory for the duration of the run, and `PI_CODING_AGENT_DIR` is cleared — `getAgentDir()` consults it first, so redirecting the home directory alone would not have contained a contributor who has it set.
+- **`vitest.config.ts` is no longer published to npm.** It refers to `test/`, which `.npmignore` excludes, so the tarball carried a config file pointing at files that were not there.
+
+## [0.8.0] - 2026-08-16
+
+### Added
+- **Custom widget sort orders.** `sortOrder` now also accepts a *sort spec* — an ordered list of comparison keys (`id` / `status` / `updatedAt`), each with an optional `direction` and, on `status`, a custom `rank` — written into `tasks-config.json` at either scope. A new `active` preset (in-progress → pending → completed, then by id) covers the common case from `/tasks` → Settings without editing a file. Specs are data, not code: anything unrecognised falls back to `id` order, which also tightens a typo'd `sortOrder` name that previously left tasks in storage order. See [CUSTOMIZING.md](CUSTOMIZING.md). ([#35](https://github.com/tintinweb/pi-tasks/pull/35) — thanks [@Minh-Ng](https://github.com/Minh-Ng) — and [#54](https://github.com/tintinweb/pi-tasks/pull/54) — thanks [@Rizhiy](https://github.com/Rizhiy))
+- **Completed tasks can be collapsed to a single line.** `collapseCompleted` (default `false`, toggleable from `/tasks` → Settings) replaces finished tasks with one `✔ N completed` line at the bottom of the widget. It composes with the visible limit rather than overriding it: collapsing decides what is in the list, then `maxVisible` / `showAll` / `hiddenAt` apply to what is left. The header still counts every task. ([#54](https://github.com/tintinweb/pi-tasks/pull/54) — thanks [@Rizhiy](https://github.com/Rizhiy))
+- **A customization guide** — [CUSTOMIZING.md](CUSTOMIZING.md), linked from the README: config scopes and precedence, the display settings and the order they apply in, sort presets and specs, recipes, and troubleshooting.
+
+### Fixed
+- **An unrecognised `hiddenAt` value no longer blanks the task widget.** Anything other than `top` or `bottom` in a hand-edited `tasks-config.json` threw on every render; the widget's render guard caught it, so the widget silently showed nothing at all with tasks still in the list. The value now falls back to `bottom`.
+- **A new batch of tasks no longer lands under the completed list from the last one.** Both auto-clear modes count in turns and only tick at `turn_start`, so the countdown stops when the agent does — and a run that ends right after its final completion, which is the usual shape, freezes one mid-count. The finished list then stayed on screen, and the next batch was appended to it (`#4` under three completed rows) rather than starting fresh, which reset the countdown again; across a session of short batches the list never cleared. A task created after the agent has stopped now retires a list that has nothing left to do, before it is added to it. The finished list still stays visible while you read it and through follow-up questions, a list with unfinished work in it is untouched, and task IDs remain monotonic. Tasks the agent adds while working through a list are unaffected — that is the same batch taking shape, not a new one, which is why the run boundary rather than the list's state decides. Also fixes the same problem on a resumed session, where the countdown never started at all. (Reported in [#51](https://github.com/tintinweb/pi-tasks/pull/51) — thanks [@ElJeskos](https://github.com/ElJeskos) — and [#56](https://github.com/tintinweb/pi-tasks/issues/56) — thanks [@kunaaal13](https://github.com/kunaaal13))
+- **An auto-cleared session task file is deleted rather than left behind empty.** Clearing writes the emptied list back to `.pi/tasks/tasks-<sessionId>.json`; the manual and session-start clear paths already removed the file afterwards, the automatic one did not.
+
+## [0.7.3] - 2026-08-16
+
+### Fixed
+- **The active-task spinner animates at a steady rate.** Its frame advanced inside the widget's redraw, which also runs on every task mutation and tool execution — so the animation raced ahead during bursts of activity and stalled when nothing was happening. The frame now advances only on the widget's own 150 ms timer. (Diagnosed in [#41](https://github.com/tintinweb/pi-tasks/pull/41) — thanks [@xz-dev](https://github.com/xz-dev))
+- **Task paths resolve from the session's workspace, not the directory pi was started in.** The two match in the ordinary terminal flow, but not in a host that serves sessions from elsewhere, or when a session is opened by an explicit path from another project — those wrote every session's tasks into whichever directory pi happened to start in. Task files, `.pi/tasks-config.json` and relative `PI_TASKS` paths now all follow the workspace pi reports for the session, the same one its own file tools use. This also makes the `taskScope` setting take effect on the next session start as its description promises; it previously needed a full restart. If you open sessions by path from outside their project, an existing `.pi/tasks/` in your launch directory will no longer be read — the files are untouched, just no longer the ones in use. ([#45](https://github.com/tintinweb/pi-tasks/pull/45) — thanks [@yeyaowei](https://github.com/yeyaowei))
+- **A malformed task file no longer corrupts task IDs or silently empties the list.** `normalizeTask` hardens each record, but nothing checked the envelope around them. A file that parsed but had no `nextId` produced the task ID `"NaN"`, and after the next reload IDs restarted at `"0"` — colliding with tasks already in the list — while a file with no `tasks` array threw mid-load and left the store wiped. The counter is now derived from the records when the stored one is missing or stale, entries that aren't task records are skipped, and a file that isn't usable leaves the current state untouched.
+- **Subagents are reattached to their tasks after a reload.** The agent→task map lives only in the extension instance, so a reload started with an empty one while the subagents kept running. Every completion or failure event for an agent spawned before the reload was dropped and its task stayed `in_progress` permanently — and with auto-cascade on, the rest of the chain stalled behind it. The map is now rebuilt on session start from the `agentId` already recorded in task metadata. Only `in_progress` tasks are relinked, so a late event cannot resurrect a task that was reverted to pending. Fixes #47.
+- **A finishing subagent can no longer close an unrelated task in the next session.** The agent→task map was never cleared on `/new`, `/resume` or `/fork`, and task IDs restart at 1 in every session — so a mapping held over from the previous session pointed at a different task, which the agent's completion then marked completed and overwrote the metadata of. The map is cleared on every session switch and rebuilt from the incoming session's own tasks.
+- **`pi --no-session` no longer leaves a task file behind.** pi mints a session ID even when it is not persisting the session, so a session-scoped store wrote `.pi/tasks/tasks-<id>.json` for a session that could never be resumed, and left it on disk. Tasks now stay in memory whenever pi reports no session file. Fixes #43.
+- **`TaskOutput` and `TaskStop` now act on the task an agent ID refers to.** Both tools accept an agent ID in place of a task ID and resolve it through the agent→task map, but then kept querying the store with the original argument. `TaskStop` therefore stopped the subagent and reported success while leaving the task `in_progress` and its widget spinner running, and `TaskOutput` reported the status captured before the wait — visible on file-backed stores, where each read deserializes a fresh object.
+- **Releasing a file lock no longer deletes a lock that has changed hands.** Stale-lock detection asks the local process table whether the holder is alive, so a session in another PID namespace — a container, or a list shared over NFS — can read a live holder's PID as dead and reclaim the lock. The original holder then deleted the successor's lock on the way out, leaving two sessions writing the file at once. Lock files now carry a `<pid>:<uuid>` token and are only removed by the session that wrote them.
+- **A lock file left behind without a PID no longer wedges a shared task list.** `acquireLock()` writes the lock file and then its PID, so a crash in between leaves an empty lock naming no process. Stale-lock detection only recognised locks naming a *dead* process, so every later mutation burned the full 5-second retry budget and threw — permanently, until the file was deleted by hand. An unreadable PID now counts as stale too, after a couple of polls so a live acquirer in that same window is not evicted.
+- **`TaskOutput` rejects an empty `task_id`.** It accepts agent IDs and matches them by prefix, and every ID starts with the empty string — so an empty argument silently reported on whichever background agent the internal map yielded first. It now fails with `task_id is required`, matching `TaskStop`.
+
+## [0.7.2] - 2026-07-22
+
+### Added
+- **Global task defaults** can be set in `<agent-dir>/tasks-config.json` (`~/.pi/agent/tasks-config.json` by default). Project settings in `<cwd>/.pi/tasks-config.json` override global values key by key, and the settings menu persists only project-level differences. (#36)
+- **The system-reminder now catches stale `in_progress` tasks.** Previously the reminder could only fire from the `tool_result` hook, so an agent that finished a turn with text only (no tool call) was never nudged and could leave tasks stuck `in_progress`. That case is now detected on `turn_end` and a reminder is scheduled for the next LLM call. (#37)
+
+### Changed
+- **The auto-cascade setting is easier to find** in `/tasks` → Settings because its label now uses the same "auto-cascade" terminology as the documentation.
+- **System-reminder reshaped after Claude Code's todo reminders** — it is now either an empty-list nudge or a JSON echo of the current task list. The echo is capped at 10 tasks (completed dropped first) to bound its size on large or long-lived lists, and says so when truncated rather than presenting itself as the full list. Also restores the cheap `store.list()` guard on the hot `tool_result` path and stops mutating the shared cadence config. (#37)
+
+### Fixed
+- **Legacy task files no longer crash the host on load.** Task files written before the dependency feature have no `blockedBy`/`blocks`/`metadata` fields; `TaskStore.load()` deserialized them as-is, so unguarded reads (e.g. `task.blockedBy.length` in the widget) threw a `TypeError`. Because the widget renders on a pi-tui timer, that throw was uncaught and killed the whole pi process on the first render after upgrade. Every record is now normalized at the `load()` boundary (`normalizeTask`, with type guards for hand-edited files), and the widget render is wrapped in a `try/catch` returning a safe fallback so a render error can never again escape to the TUI timer. Fixes #33. (#39)
+- **Persisted tasks are rehydrated correctly on reload, and forks get an independent copy.** `session_switch` is never emitted by the SDK, so the `/new` and `/resume` reset logic was dead code and forks silently lost (or leaked writes into) the parent's tasks. All session lifecycle handling is consolidated into `session_start`, keyed on `event.reason`: `new`/`resume`/`fork` reset session-scoped state (store pointer, shown flag, cadence, auto-clear) on the cached closure, while `startup`/`reload` start clean; on `/fork` the parent's tasks are snapshotted and seeded into the new session file so writes no longer leak back. Adds `TaskStore.snapshot()`/`seed()`. (#34)
+- **Task-store writes survive removal of the parent directory** — `acquireLock()` and `save()` now `mkdir -p` the target directory before writing, so a task write after the `.pi/tasks/` directory was deleted mid-session recreates it instead of throwing. (#27)
+- **The task directory is created lazily, on first write** — the `TaskStore` constructor no longer eagerly creates `.pi/tasks/`. A session that never persists a task now leaves no `.pi/tasks/` directory behind. (#38)
+
+## [0.7.1] - 2026-06-24
+
+### Changed
+- **`TaskExecute` now offers a recovery path when subagents are unavailable.** When `@tintinweb/pi-subagents` isn't loaded (or its protocol version mismatches), the tool previously dead-ended with "ensure the extension is loaded". It now tells the agent it can run the work as plain Agent-tool spawns, with the explicit caveat that pi-tasks won't track those — status stays pending, cascade won't fire, and `TaskOutput` stays empty. Scoped to the unavailable branch so it doesn't conflict with the success-path guideline. Message only; no behaviour change. (#26)
+
+## [0.7.0] - 2026-05-30
+
+### Changed
+- **⚠ Behaviour change — system-reminder delivery.** The periodic `<system-reminder>` nudge was previously appended onto the `content` of whatever unrelated tool (`read`, `bash`, `grep`, …) happened to run when it was due. That misattributed host policy text as tool output and **persisted a now-stale reminder into session history**, so it reappeared on every later turn even after task tools were used. It is now injected via the `context` hook as a **transient** `<system-reminder>`-tagged user message on the one request where it's due — not persisted, and not attached to any tool result. `tool_result` is now used solely for cadence tracking and never mutates tool output. The *cadence* (when a reminder fires) is unchanged; only the delivery mechanism and persistence differ. Cadence logic was extracted into a pure, unit-tested `src/reminder-cadence.ts`. (#19)
+
+### Added
+- **Configurable widget display settings** — four new options in `/tasks` → Settings (persisted to `.pi/tasks-config.json`), all defaulting to the previous behaviour: (#22)
+  - `sortOrder` (default `id`) — `id` (creation order), `status` (completed → in-progress → pending), `recent` / `oldest` (by last-updated time). Sort logic lives in `TaskStore.list(sortOrder)`.
+  - `maxVisible` (default `10`) — caps how many task lines the widget shows (`5`–`100`).
+  - `showAll` (default `false`) — when `true`, every task is shown regardless of `maxVisible`.
+  - `hiddenAt` (default `bottom`) — controls whether the `… and N more` overflow collapses from the `bottom` or `top` of the list; `top` pairs with `sortOrder: status` to keep active work visible.
+
+## [0.6.1] - 2026-05-30
+
+### Fixed
+- **CI test failures on `webidl.util.markAsUncloneable is not a function`** — bumped the GitHub Actions `node-version` from `20` to `22`. Node 20's bundled `undici` lacks `webidl.util.markAsUncloneable`, which pi's event/RPC layer (exercised by `subagent-integration.test.ts`) requires. Matches the same fix in `@tintinweb/pi-subagents`.
+
+## [0.6.0] - 2026-05-30
+
+### Changed
+- **Migrated pi peer dependencies to the `@earendil-works` scope** — `@mariozechner/pi-coding-agent` and `@mariozechner/pi-tui` (`>=0.70.5`) → `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` (`>=0.74.0`). Package was renamed/rescoped across `package.json` and `src` imports; lockfile regenerated. Matches the same migration in `@tintinweb/pi-subagents`. (#21)
+
 ## [0.5.0] - 2026-04-28
 
 ### Changed
@@ -152,6 +239,16 @@ Initial release — Claude Code-style task tracking and coordination for pi.
 - **Background process tracker** — output buffering (stdout + stderr), waiter notification, graceful stop with timeout escalation (SIGTERM → 5s → SIGKILL).
 - **78 unit tests** — task store CRUD, dependencies, warnings, file persistence; widget rendering, icons, spinners, token/duration formatting; process tracker lifecycle.
 
+[0.9.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.9.0
+[0.8.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.8.0
+[0.7.3]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.7.3
+[0.7.2]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.7.2
+[0.7.1]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.7.1
+[0.7.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.7.0
+[0.6.1]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.6.1
+[0.6.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.6.0
+[0.5.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.5.0
+[0.4.3]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.2
 [0.4.1]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.1
 [0.4.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.4.0

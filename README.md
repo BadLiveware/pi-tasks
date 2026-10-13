@@ -12,12 +12,13 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 
 ## Features
 
-- **7 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — for task creation, updates, execution, and inspection
+- **7 LLM (large language model)-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — for task creation, updates, execution, and inspection
 - **Batch task mutations** — create whole task sets in one `TaskCreate` call and update/complete/delete multiple tasks in one `TaskUpdate` call
 - **Hierarchical task trees** — model parent/subtask relationships, nested trees, aggregate subtask progress, parallel-capable siblings, and ready-to-complete parent hints
 - **Persistent widget** — live task list above the editor with tree connectors, `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, a Pi-style braille spinner (`⠋⠙⠹⠸`) for active tasks, and a smart viewport that keeps active/actionable work visible in larger lists
-- **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
+- **System-reminder injection** — periodic `<system-reminder>` nudges injected into the upcoming model request through the `context` hook, never persisted or added to unrelated tool output; also detects stale in-progress tasks
 - **Stop-hook cleanup prompt** — when an agent stops with open tasks, pi-tasks injects a follow-up prompt asking it to complete finished tasks, delete obsolete ones, or keep working real in-scope work instead of leaving abandoned rows behind
+- **Configurable widget** — [custom glyphs](CUSTOMIZING.md#task-glyphs), sort presets and sort specs, completed-task collapse, and explicit top/bottom visible limits
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
 - **Dependency and relationship management** — hard `blocks`/`blockedBy` dependencies plus non-blocking relationships such as `parent`, `related`, `validates`, `supersedes`, and `orderAfter`
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
@@ -49,7 +50,7 @@ The extension renders a persistent widget above the editor:
   ◻ #4 Test time travel at 88 mph › blocked by #2, #3
 ```
 
-| Icon | Meaning |
+| Glyph | Meaning |
 |------|---------|
 | `✔` | Completed (strikethrough + dim) |
 | `◼` | In-progress (not actively executing) |
@@ -71,6 +72,44 @@ Long task trees stay focused on current work:
   ├─ ◻ #71 Take first-light photo › blocked by #69
   … 5 hidden tasks
 ```
+
+### Widget display settings
+
+How tasks are sorted and how many are shown can be configured via `/tasks` → Settings (saved as project overrides in `.pi/tasks-config.json`), except `glyphs`, which is set in the config file directly.
+With no explicit `sortOrder`, `maxVisible`, or `hiddenAt`, the widget keeps the fork's pending-first flat order and smart viewport (14 task rows, or 10–18 based on terminal height).
+Explicit `sortOrder` sorts roots and siblings while keeping subtasks under their parents.
+Explicit `maxVisible` or `hiddenAt` selects top/bottom truncation and ID order unless `sortOrder` is set.
+`showAll` bypasses either limit; `collapseCompleted` works with both modes.
+
+> **[→ Customizing the task widget](CUSTOMIZING.md)** — the full guide: global vs. project config, sort presets, writing your own sort order, and recipes.
+
+| Setting | Values | Default | Behaviour |
+|---------|--------|---------|-----------|
+| `sortOrder` | `id` / `status` / `active` / `recent` / `oldest`, or a [sort spec](CUSTOMIZING.md#writing-your-own-sort-order) | fork order when unset | `id` = creation order; `status` groups completed → in-progress → pending; `active` is the reverse grouping (in-progress → pending → completed); `recent`/`oldest` = by last-updated time |
+| `collapseCompleted` | `true` / `false` | `false` | When `true`, completed tasks are replaced by a single `✔ N completed` line at the bottom |
+| `maxVisible` | `5`–`100` | smart viewport when unset | Caps how many task lines the widget shows (ignored when `showAll` is on) |
+| `showAll` | `true` / `false` | `false` | When `true`, every listed task is shown regardless of `maxVisible` |
+| `hiddenAt` | `bottom` / `top` | smart viewport when unset | When the list overflows `maxVisible`, where the `… and N more` collapse happens. `top` pairs well with `sortOrder: status` to keep active work visible and fold completed tasks away |
+| `glyphs` | a [glyph set](CUSTOMIZING.md#task-glyphs) | `✔` / `◼` / `◻` + braille spinner | Every character the widget is drawn with — status marks, spinner frames, header bullet, overflow and truncation markers, token arrows. Config file only |
+
+> Note: the widget's `status` order is completed-first (so finished work collapses at the top with `hiddenAt: top`), which is the reverse of the `TaskList` tool's pending-first order. Use `active` for pending-first.
+
+`collapseCompleted` and the visible limit are independent: collapsing decides what goes in the list, and `maxVisible` / `showAll` / `hiddenAt` then apply to whatever remains.
+
+For an order the presets don't cover, `sortOrder` also accepts a **sort spec** — an ordered list of comparison keys, written into `tasks-config.json`:
+
+```json
+{
+  "sortOrder": [
+    { "field": "status", "rank": ["in_progress", "pending", "completed"] },
+    { "field": "id" }
+  ]
+}
+```
+
+See [Writing your own sort order](CUSTOMIZING.md#writing-your-own-sort-order) for the full key reference and recipes.
+
+> Configuration is data, never code. There is deliberately no executable config file, so nothing in a cloned repository's `.pi/` can run on your machine.
 
 ## Tools
 
@@ -216,6 +255,8 @@ Retrieve output from a background task process.
 
 Both task IDs and agent IDs (including partial prefixes) are accepted — agent IDs are resolved via the internal `agentTaskMap`.
 
+For a subagent task that has finished, the tool returns the agent's stored result (or its error) under the status line, so joining a task and reading what it produced is one call. Doing so also [consumes the result](#joining-a-subagent).
+
 ### `TaskStop`
 
 Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a stop RPC.
@@ -246,7 +287,9 @@ pending → in_progress → completed
                       → deleted (permanently removed)
 ```
 
-Tasks are created as `pending`. Mark `in_progress` before starting work, `completed` when done. `deleted` removes entirely — IDs never reset.
+Tasks default to `pending`; `TaskCreate` also accepts initial `in_progress` status.
+Mark `in_progress` before starting work and `completed` when done.
+`deleted` removes the task entirely; IDs never reset.
 
 ## Dependency, Hierarchy, and Relationship Management
 
@@ -300,8 +343,25 @@ Task storage is controlled by the `taskScope` setting (`/tasks` → Settings →
 | Mode | File | Behaviour |
 |------|------|-----------|
 | `memory` | *(none)* | In-memory only — tasks lost when session ends |
-| `session` **(default)** | `<cwd>/.pi/tasks/tasks-<sessionId>.json` | Per-session file — isolated between sessions, survives resume |
-| `project` | `<cwd>/.pi/tasks/tasks.json` | Shared across all sessions in the project |
+| `session` **(default)** | `<workspace>/.pi/tasks/tasks-<sessionId>.json` | Per-session file — isolated between sessions, survives resume |
+| `session-global` | `<agent-dir>/tasks/sessions/<project-key>/tasks-<sessionId>.json` | The same, kept outside the workspace so repositories stay clean |
+| `project` | `<workspace>/.pi/tasks/tasks.json` | Shared across all sessions in the project |
+
+`<workspace>` is the directory pi reports for the session — the same one its file tools operate in. That is normally where you started pi; it differs only when a session is opened by an explicit path from another project, or when a host serves sessions from elsewhere.
+
+`session-global` exists because a per-session file keyed by a session ID is runtime state, not project content: it means nothing to anyone else who clones the repository, and it costs a `.gitignore` rule per project. `<agent-dir>` is `~/.pi/agent` unless pi is configured otherwise, the same directory the [global settings](#global-defaults) live in. `<project-key>` encodes the workspace path the way pi encodes it for its own session logs (`/Users/me/work/repo` → `--Users-me-work-repo--`), so a project's task files sit under the same name as its transcripts and same-ID sessions in different workspaces cannot collide.
+
+Under either session scope, tasks stay in memory whenever pi is not persisting the session (`pi --no-session`) — there is no session for the file to belong to, so none is written. `project` scope still writes its shared list, since that belongs to the project rather than the session.
+
+Switching to `session-global` never moves or deletes anything. It changes where *new* session files are created; a session that already has a file in `<workspace>/.pi/tasks/` keeps using it, so resuming that session still finds its tasks and switching back to `session` strands nothing. To empty an existing `.pi/tasks/`, clear those sessions' tasks as usual — the file is removed once its list is empty.
+
+Picking `session-global` from `/tasks` → Settings saves it as a *project* override in `<workspace>/.pi/tasks-config.json`, so that repository still gets a `.pi/` — holding config rather than task data. To apply it everywhere and leave repositories alone, set it once as a [global default](#global-defaults) instead:
+
+```json
+{
+  "taskScope": "session-global"
+}
+```
 
 On new session start, if all persisted tasks are completed they are auto-cleared for a clean slate. On session resume, all tasks (including completed) are shown so the user can review progress. Empty session files are automatically deleted when all tasks are cleared.
 
@@ -312,16 +372,36 @@ The `autoClearCompleted` setting controls automatic cleanup of completed tasks:
 | Mode | Behaviour |
 |------|-----------|
 | `never` | Completed tasks stay visible until manually cleared via `/tasks` → Clear completed |
-| `on_list_complete` **(default)** | Cleared after all tasks are done and a few idle turns pass |
+| `on_list_complete` **(default)** | Cleared once all tasks are done and a few idle turns pass |
 | `on_task_complete` | Each completed task cleared individually after a few turns |
 
 Both auto-clear modes use a turn-based delay for non-jarring UX — tasks linger briefly so you see the completion before they disappear.
 
 ### Stop-hook open task cleanup
 
-On `agent_end`, if pending or in-progress tasks remain and no other extension follow-up is pending, pi-tasks injects a follow-up prompt that tells the agent to resolve the list before stopping: complete only fully finished tasks, delete obsolete or accidental tasks, and continue real in-scope work instead of leaving stale tasks behind. The hook fingerprints the current open-task snapshot so the same unresolved list is not re-prompted in a loop; new user input resets the prompt gate.
+On `agent_end`, if pending or in-progress tasks remain and no other extension follow-up is pending, pi-tasks injects a follow-up prompt that tells the agent to resolve the list before stopping: complete only fully finished tasks, delete obsolete or accidental tasks, and continue real in-scope work instead of leaving stale tasks behind.
+The hook fingerprints the current open-task snapshot so the same unresolved list is not re-prompted in a loop; new user input and session switches reset the prompt gate.
 
-Settings (`taskScope`, `autoCascade`, `autoClearCompleted`) are saved to `<cwd>/.pi/tasks-config.json`.
+
+In either mode, a list with nothing left to do is also retired when a *later* batch of work begins, however long it has been sitting there. The turn delay only runs while the conversation does, so a list completed just before the agent stopped would otherwise still be on screen when the next task arrived, and that task would join it. The finished list stays visible while you read it and through any follow-up question, and goes when the agent starts new work. Tasks the agent adds to a list it is still working through are unaffected, and task IDs stay monotonic and are never reused.
+
+Settings (`taskScope`, `autoCascade`, `autoClearCompleted`, plus the [widget display settings](#widget-display-settings) `sortOrder` / `collapseCompleted` / `maxVisible` / `showAll` / `hiddenAt`) changed through `/tasks` are saved as project overrides in `<workspace>/.pi/tasks-config.json`. `glyphs` is config-file only — see [CUSTOMIZING.md](CUSTOMIZING.md#task-glyphs).
+
+### Global defaults
+
+Put settings that should apply across projects in `<agent-dir>/tasks-config.json` (`~/.pi/agent/tasks-config.json` by default). The agent directory follows pi's configured agent path. Project settings in `<workspace>/.pi/tasks-config.json` take precedence key by key.
+
+For example, enable auto-cascade by default for every project:
+
+```json
+{
+  "autoCascade": true
+}
+```
+
+The `/tasks` settings menu writes only project overrides. Changing another setting in a project does not copy global defaults into that project's config.
+
+See [Customizing the task widget](CUSTOMIZING.md#where-config-lives) for worked examples of how the two files merge.
 
 ### Override via environment variables
 
@@ -330,7 +410,7 @@ Settings (`taskScope`, `autoCascade`, `autoClearCompleted`) are saved to `<cwd>/
 | `PI_TASKS` | `off` | In-memory only (CI/automation) |
 | `PI_TASKS` | `sprint-1` | Named shared list at `~/.pi/tasks/sprint-1.json` |
 | `PI_TASKS` | `/abs/path/tasks.json` | Explicit absolute file path |
-| `PI_TASKS` | `./tasks.json` | Relative path resolved from cwd |
+| `PI_TASKS` | `./tasks.json` | Relative path resolved from the session workspace |
 | *(unset)* | | Uses `taskScope` setting (default: `session`) |
 | `PI_TASKS_DEBUG` | `1` | Trace RPC communication (request/reply/timeout) and spawn errors to stderr |
 
@@ -363,7 +443,7 @@ Tasks
 - **Create task** — input prompts for subject and description
 - **Clear completed** — remove all completed tasks
 - **Clear all** — remove all tasks regardless of status
-- **Settings** — configure task storage, auto-cascade, and auto-clear completed tasks (saved to `tasks-config.json`)
+- **Settings** — configure project overrides for task storage, auto-cascade, auto-clear completed tasks, and [widget display](#widget-display-settings) (sort order, max visible, show all, hidden position)
 
 ## Cross-extension Communication with [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents)
 
@@ -411,9 +491,23 @@ The returned `id` is stored in an in-memory `agentTaskMap` (agentId → taskId) 
 | `subagents:completed` | `{ id, result? }` | Mark task `completed`, trigger auto-cascade if enabled |
 | `subagents:failed` | `{ id, error?, status }` | Revert task to `pending`, store error in metadata |
 
+### Joining a Subagent
+
+`TaskOutput` waits on those same lifecycle events and then returns the stored result. Handing it to the model *consumes* it: pi-tasks says so over the bus, and pi-subagents drops the completion notification it was holding for that agent, which would otherwise arrive after the model had already answered and cost a turn to dismiss.
+
+```
+pi-tasks                                pi-subagents
+   │                                         │
+   │◀─ subagents:completed ─────────────────│  { id, result }
+   │── subagents:rpc:consume ───────────────▶│  { requestId, agentId }
+   │                                         │
+```
+
+Fire-and-forget, and deliberately outside the version handshake — a [`pi-subagents`](https://github.com/tintinweb/pi-subagents) without the handler keeps notifying, exactly as before. An agent that is still running is never consumed: nothing has been read from it yet, and its notification is the only thing that will announce it.
+
 ### Standalone Mode
 
-If [`pi-subagents`](https://github.com/tintinweb/pi-subagents) is not installed, everything works except `TaskExecute`, which returns a friendly error message. All core task tools (create, list, get, update, dependencies, widget, system-reminder injection) function independently.
+If [`pi-subagents`](https://github.com/tintinweb/pi-subagents) is not installed, everything works except `TaskExecute`, which returns a friendly message explaining the agent can fall back to plain Agent-tool spawns — with the caveat that pi-tasks won't track those (status stays `pending`, auto-cascade won't fire, `TaskOutput` stays empty). All core task tools (create, list, get, update, dependencies, widget, system-reminder injection) function independently.
 
 ## Architecture
 
@@ -423,11 +517,17 @@ src/
 ├── types.ts            # Task, TaskStatus, BackgroundProcess types
 ├── task-store.ts       # File-backed store with CRUD, dependencies, locking
 ├── auto-clear.ts       # Turn-based auto-clearing of completed tasks (AutoClearManager)
+├── task-mutation-tools.ts # Batch creation/update registration and workflows
+├── hierarchy.ts        # Parent/subtask trees and progress summaries
 ├── stop-hook.ts        # agent_end follow-up prompt for unresolved task cleanup
-├── tasks-config.ts     # Config persistence (taskScope, autoCascade, autoClearCompleted) → .pi/tasks-config.json
+├── tasks-config.ts     # Global defaults and project override persistence
+├── task-paths.ts       # Where session task files live, per taskScope
+├── task-glyphs.ts      # Glyph defaults and config validation
+├── task-sort.ts        # Widget ordering: sort presets and sort specs
+├── reminder-cadence.ts # Pure cadence logic for system-reminder injection
 ├── process-tracker.ts  # Background process output buffering and stop
 └── ui/
-    ├── task-widget.ts  # Persistent widget with status icons and spinner
+    ├── task-widget.ts  # Persistent widget with status glyphs and spinner
     └── settings-menu.ts  # /tasks → Settings panel (SettingsList TUI component)
 ```
 

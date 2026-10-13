@@ -1,5 +1,5 @@
 /**
- * task-widget.ts — Persistent widget showing task list with status icons and progress.
+ * task-widget.ts — Persistent widget showing task list with status glyphs and progress.
  *
  * Display style matches Claude Code's task list:
  *   ✔ completed tasks (strikethrough + dim)
@@ -16,7 +16,21 @@ import {
   formatTaskRefs,
   getOpenBlockerIds,
 } from "../hierarchy.js";
+import { resolveTaskGlyphs } from "../task-glyphs.js";
 import type { TaskStore } from "../task-store.js";
+import type { TasksConfig } from "../tasks-config.js";
+
+// ---- Truncation ----
+
+function truncateFromTop<T>(tasks: T[], limit: number): T[] {
+  return tasks.slice(-limit);
+}
+
+function truncateFromBottom<T>(tasks: T[], limit: number): T[] {
+  return tasks.slice(0, limit);
+}
+
+const TRUNCATE_FNS = { top: truncateFromTop, bottom: truncateFromBottom };
 
 // ---- Types ----
 
@@ -35,13 +49,12 @@ export type UICtx = {
   ): void;
 };
 
-/** Pi-style braille spinner frames for animated active task indicators. */
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 180;
 
 const DEFAULT_VISIBLE_TASK_ROWS = 14;
 const MIN_VISIBLE_TASK_ROWS = 10;
 const MAX_VISIBLE_TASK_ROWS = 18;
+const DEFAULT_MAX_VISIBLE_TASKS = 10;
 
 /** Per-task runtime metrics (elapsed time, token usage). */
 export interface TaskMetrics {
@@ -159,8 +172,9 @@ function buildWidgetViewport(
   return items;
 }
 
-function formatHiddenTasks(hiddenCount: number): string {
-  return hiddenCount === 1 ? "… 1 hidden task" : `… ${hiddenCount} hidden tasks`;
+function formatHiddenTasks(hiddenCount: number, overflow: string): string {
+  if (hiddenCount === 1) return `${overflow} 1 hidden task`;
+  return `${overflow} ${hiddenCount} hidden tasks`;
 }
 
 // ---- Widget ----
@@ -178,7 +192,10 @@ export class TaskWidget {
   /** Whether the widget callback is currently registered. */
   private widgetRegistered = false;
 
-  constructor(private store: TaskStore) {}
+  constructor(
+    private store: TaskStore,
+    private config: TasksConfig = {},
+  ) {}
 
   setStore(store: TaskStore) {
     this.store = store;
@@ -214,18 +231,38 @@ export class TaskWidget {
     }
   }
 
-  /** Ensure the widget update timer is running. */
+  /** Ensure the widget update timer is running. The spinner advances here and
+   *  nowhere else: `update()` also runs on every task mutation and tool execution,
+   *  so incrementing there tied the animation speed to how busy the agent was. */
   ensureTimer() {
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), SPINNER_INTERVAL_MS);
+      this.widgetInterval = setInterval(() => {
+        this.widgetFrame++;
+        this.update();
+      }, SPINNER_INTERVAL_MS);
     }
   }
 
-  /** Build widget lines from current live state. Called from the render callback. */
+  /** Render callback entry point. Guarded so a render error can never escape to
+   *  the TUI timer and crash the whole host process — worst case the widget is
+   *  empty for one frame. */
   private renderWidget(tui: any, theme: Theme): string[] {
-    const tasks = this.store.list();
+    try {
+      return this.buildWidgetLines(tui, theme);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Build widget lines from current live state. */
+  private buildWidgetLines(tui: any, theme: Theme): string[] {
+    const sortOrder = this.config.sortOrder ?? "id";
+    // Resolved per render, not cached: the extension swaps this config object's
+    // contents when the host moves to a session in another workspace.
+    const glyphs = resolveTaskGlyphs(this.config.glyphs);
+    const tasks = this.store.list(sortOrder);
     const w = tui.terminal.columns;
-    const truncate = (line: string) => truncateToWidth(line, w);
+    const truncate = (line: string) => truncateToWidth(line, w, glyphs.truncation);
 
     if (tasks.length === 0) return [];
 
@@ -239,15 +276,42 @@ export class TaskWidget {
     if (pending.length > 0) parts.push(`${pending.length} open`);
     const statusText = `${tasks.length} tasks (${parts.join(", ")})`;
 
-    const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
-    const lines: string[] = [truncate(theme.fg("accent", "●") + " " + theme.fg("accent", statusText))];
+    const spinnerFrame = glyphs.spinner[this.widgetFrame % glyphs.spinner.length];
+    const lines: string[] = [truncate(theme.fg("accent", glyphs.header) + " " + theme.fg("accent", statusText))];
 
     const hierarchy = buildTaskHierarchy(tasks);
-    const rows = flattenTaskHierarchy(hierarchy);
-    const viewport = buildWidgetViewport(rows, hierarchy, this.activeTaskIds, visibleTaskRowBudget(tui));
+    const preserveOrder = this.config.sortOrder !== undefined ||
+      this.config.maxVisible !== undefined || this.config.hiddenAt !== undefined;
+    const rows = flattenTaskHierarchy(hierarchy, preserveOrder);
+    const collapseCompleted = this.config.collapseCompleted ?? false;
+    let listed = rows;
+    if (collapseCompleted) listed = rows.filter(row => row.task.status !== "completed");
+
+    let viewport: WidgetViewportItem[];
+    if (this.config.showAll) {
+      viewport = listed.map(row => ({ kind: "row", row }));
+    } else if (this.config.maxVisible !== undefined || this.config.hiddenAt !== undefined) {
+      const limit = this.config.maxVisible ?? DEFAULT_MAX_VISIBLE_TASKS;
+      const hiddenAt = this.config.hiddenAt === "top" ? "top" : "bottom";
+      const visible = TRUNCATE_FNS[hiddenAt](listed, limit);
+      viewport = visible.map(row => ({ kind: "row", row }));
+      const hiddenCount = listed.length - visible.length;
+      if (hiddenCount > 0) {
+        const marker: WidgetViewportItem = { kind: "marker", hiddenCount };
+        if (hiddenAt === "top") viewport.unshift(marker);
+        else viewport.push(marker);
+      }
+    } else {
+      viewport = buildWidgetViewport(listed, hierarchy, this.activeTaskIds, visibleTaskRowBudget(tui));
+    }
+
     for (const item of viewport) {
       if (item.kind === "marker") {
-        lines.push(truncate(theme.fg("dim", `  ${formatHiddenTasks(item.hiddenCount)}`)));
+        let text = formatHiddenTasks(item.hiddenCount, glyphs.overflow);
+        if (this.config.maxVisible !== undefined || this.config.hiddenAt !== undefined) {
+          text = `${glyphs.overflow} and ${item.hiddenCount} more`;
+        }
+        lines.push(truncate(theme.fg("dim", `  ${text}`)));
         continue;
       }
 
@@ -255,15 +319,15 @@ export class TaskWidget {
       const task = row.task;
       const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
 
-      let icon: string;
+      let statusGlyph: string;
       if (isActive) {
-        icon = theme.fg("accent", spinnerChar);
+        statusGlyph = theme.fg("accent", spinnerFrame);
       } else if (task.status === "completed") {
-        icon = theme.fg("success", "✔");
+        statusGlyph = theme.fg("success", glyphs.completed);
       } else if (task.status === "in_progress") {
-        icon = theme.fg("accent", "◼");
+        statusGlyph = theme.fg("accent", glyphs.inProgress);
       } else {
-        icon = "◻";
+        statusGlyph = glyphs.pending;
       }
 
       const suffixParts: string[] = [];
@@ -276,7 +340,8 @@ export class TaskWidget {
       if (task.status === "pending" && openBlockers.length > 0) {
         suffixParts.push(`blocked by ${formatTaskRefs(openBlockers)}`);
       }
-      const suffix = suffixParts.length > 0 ? theme.fg("dim", ` › ${suffixParts.join(" · ")}`) : "";
+      let suffix = "";
+      if (suffixParts.length > 0) suffix = theme.fg("dim", ` ${glyphs.blocked} ${suffixParts.join(" · ")}`);
 
       let text: string;
       if (isActive) {
@@ -288,23 +353,29 @@ export class TaskWidget {
         if (m) {
           const elapsed = formatDuration(Date.now() - m.startedAt);
           const tokenParts: string[] = [];
-          if (m.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(m.inputTokens)}`);
-          if (m.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(m.outputTokens)}`);
+          if (m.inputTokens > 0) tokenParts.push(`${glyphs.inputTokens} ${formatTokens(m.inputTokens)}`);
+          if (m.outputTokens > 0) tokenParts.push(`${glyphs.outputTokens} ${formatTokens(m.outputTokens)}`);
           stats = tokenParts.length > 0
-            ? ` ${theme.fg("dim", `(${elapsed} · ${tokenParts.join(" ")})`)}`
+            ? ` ${theme.fg("dim", `(${elapsed} ${glyphs.statsSeparator} ${tokenParts.join(" ")})`)}`
             : ` ${theme.fg("dim", `(${elapsed})`)}`;
         }
-        text = `  ${row.connectorPrefix}${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${stats}`;
+        text = `  ${row.connectorPrefix}${statusGlyph} ${theme.fg("dim", "#" + task.id)} ${
+          theme.fg("accent", form + agentLabel + glyphs.trailingEllipsis)
+        }${stats}`;
       } else if (task.status === "completed") {
-        text = `  ${row.connectorPrefix}${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
+        text = `  ${row.connectorPrefix}${statusGlyph} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
       } else {
         const agentSuffix = task.status === "in_progress" && task.metadata?.agentId
           ? theme.fg("dim", ` (agent ${task.metadata.agentId.slice(0, 5)})`)
           : "";
-        text = `  ${row.connectorPrefix}${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
+        text = `  ${row.connectorPrefix}${statusGlyph} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
       }
 
       lines.push(truncate(text + suffix));
+    }
+
+    if (collapseCompleted && completed.length > 0) {
+      lines.push(truncate(`  ${theme.fg("success", glyphs.completedSummary)} ${theme.fg("dim", `${completed.length} completed`)}`));
     }
 
     return lines;
@@ -331,7 +402,7 @@ export class TaskWidget {
     // Prune stale active IDs (deleted or no longer in_progress)
     for (const id of this.activeTaskIds) {
       const t = this.store.get(id);
-      if (!t || t.status !== "in_progress") {
+      if (t?.status !== "in_progress") {
         this.activeTaskIds.delete(id);
         this.metrics.delete(id);
       }
@@ -345,8 +416,6 @@ export class TaskWidget {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
     }
-
-    this.widgetFrame++;
 
     // Transition: hidden → visible — register widget callback once
     if (!this.widgetRegistered) {

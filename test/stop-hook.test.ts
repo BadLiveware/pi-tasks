@@ -72,6 +72,7 @@ function mockPi() {
 
 function mockCtx(overrides: Record<string, unknown> = {}) {
   return {
+    cwd: process.cwd(),
     model: { id: "test-model", name: "Test" },
     modelRegistry: {},
     ui: {

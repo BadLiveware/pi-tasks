@@ -112,7 +112,7 @@ export function getSubtaskSummary(taskId: string, hierarchy: TaskHierarchy): Sub
 export function getOpenBlockerIds(task: Task, hierarchy: TaskHierarchy): string[] {
   return task.blockedBy.filter(blockerId => {
     const blocker = hierarchy.tasksById.get(blockerId);
-    return !blocker || blocker.status !== "completed";
+    return blocker?.status !== "completed";
   });
 }
 
@@ -149,10 +149,15 @@ export function getReadyParentIds(hierarchy: TaskHierarchy): string[] {
     .map(task => task.id);
 }
 
-export function flattenTaskHierarchy(hierarchy: TaskHierarchy): TaskHierarchyRow[] {
+export function flattenTaskHierarchy(hierarchy: TaskHierarchy, preserveOrder = false): TaskHierarchyRow[] {
   const rows: TaskHierarchyRow[] = [];
   const emitted = new Set<string>();
-  const rootOrder = hierarchy.hasHierarchy ? byId : byStatusThenId;
+  let rootOrder = byStatusThenId;
+  if (hierarchy.hasHierarchy) rootOrder = byId;
+  if (preserveOrder) {
+    const rank = new Map(hierarchy.tasks.map((task, index) => [task.id, index]));
+    rootOrder = (a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0);
+  }
 
   function append(task: Task, depth: number, connectorPrefix: string, childPrefix: string, path: Set<string>) {
     if (emitted.has(task.id)) return;
@@ -172,7 +177,8 @@ export function flattenTaskHierarchy(hierarchy: TaskHierarchy): TaskHierarchyRow
     if (path.has(task.id)) return;
     const nextPath = new Set(path);
     nextPath.add(task.id);
-    const children = getChildren(task.id, hierarchy);
+    const children = [...getChildren(task.id, hierarchy)];
+    if (preserveOrder) children.sort(rootOrder);
     for (let index = 0; index < children.length; index++) {
       const child = children[index];
       const isLast = index === children.length - 1;
@@ -190,7 +196,7 @@ export function flattenTaskHierarchy(hierarchy: TaskHierarchy): TaskHierarchyRow
     append(root, 0, "", "", new Set());
   }
 
-  for (const task of [...hierarchy.tasks].sort(byId)) {
+  for (const task of [...hierarchy.tasks].sort(rootOrder)) {
     append(task, 0, "", "", new Set());
   }
 

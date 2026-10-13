@@ -109,7 +109,7 @@ export class ProcessTracker {
   /** Stop a task's background process. SIGTERM → 5s → SIGKILL. */
   async stop(taskId: string): Promise<boolean> {
     const bp = this.processes.get(taskId);
-    if (!bp || bp.status !== "running") return false;
+    if (bp?.status !== "running") return false;
 
     bp.status = "stopped";
     bp.proc.kill("SIGTERM");

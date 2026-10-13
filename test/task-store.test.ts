@@ -1,7 +1,7 @@
-import { readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskStore } from "../src/task-store.js";
 
 describe("TaskStore (in-memory)", () => {
@@ -59,6 +59,53 @@ describe("TaskStore (in-memory)", () => {
 
     const tasks = store.list();
     expect(tasks.map(t => t.id)).toEqual(["1", "2", "3"]);
+  });
+
+  it("lists tasks sorted by status when sortOrder is 'status'", () => {
+    store.create("Pending", "Desc");           // #1
+    store.create("Completed", "Desc");         // #2
+    store.create("In progress", "Desc");       // #3
+    store.update("2", { status: "completed" });
+    store.update("3", { status: "in_progress" });
+
+    const tasks = store.list("status");
+    expect(tasks.map(t => t.subject)).toEqual(["Completed", "In progress", "Pending"]);
+  });
+
+  it("lists tasks sorted by most recently updated when sortOrder is 'recent'", () => {
+    vi.useFakeTimers({ now: 1000 });
+    store.create("First", "Desc");    // #1 created at 1000
+    vi.advanceTimersByTime(100);
+    store.create("Second", "Desc");   // #2 created at 1100
+    vi.advanceTimersByTime(100);
+    store.create("Third", "Desc");    // #3 created at 1200
+    vi.advanceTimersByTime(100);
+    store.update("1", { subject: "First updated" });  // #1 updated at 1300
+    vi.advanceTimersByTime(100);
+    store.update("3", { subject: "Third updated" });  // #3 updated at 1400
+
+    const tasks = store.list("recent");
+    // Most recently updated first: #3 (1400), #1 (1300), #2 (1100)
+    expect(tasks.map(t => t.id)).toEqual(["3", "1", "2"]);
+    vi.useRealTimers();
+  });
+
+  it("lists tasks sorted by least recently updated when sortOrder is 'oldest'", () => {
+    vi.useFakeTimers({ now: 1000 });
+    store.create("First", "Desc");    // #1 created at 1000
+    vi.advanceTimersByTime(100);
+    store.create("Second", "Desc");   // #2 created at 1100
+    vi.advanceTimersByTime(100);
+    store.create("Third", "Desc");    // #3 created at 1200
+    vi.advanceTimersByTime(100);
+    store.update("1", { subject: "First updated" });  // #1 updated at 1300
+    vi.advanceTimersByTime(100);
+    store.update("3", { subject: "Third updated" });  // #3 updated at 1400
+
+    const tasks = store.list("oldest");
+    // Least recently updated first: #2 (1100), #1 (1300), #3 (1400)
+    expect(tasks.map(t => t.id)).toEqual(["2", "1", "3"]);
+    vi.useRealTimers();
   });
 
   it("updates task status", () => {
@@ -493,5 +540,171 @@ describe("TaskStore (absolute path)", () => {
     } finally {
       rmSync(storeDir, { recursive: true, force: true });
     }
+  });
+  it("recreates the parent directory before later mutations", () => {
+    const parentDir = join(tmpdir(), `pi-tasks-missing-parent-${Date.now()}`);
+    const filePath = join(parentDir, "tasks.json");
+    const store = new TaskStore(filePath);
+    store.create("Task", "Desc");
+
+    rmSync(parentDir, { recursive: true, force: true });
+
+    expect(() => store.clearCompleted()).not.toThrow();
+    expect(existsSync(filePath)).toBe(true);
+
+    rmSync(parentDir, { recursive: true, force: true });
+  });
+
+  it("normalizes legacy task records missing blockedBy/blocks/metadata on load", () => {
+    const dir = join(tmpdir(), `pi-tasks-legacy-${process.pid}-${Date.now()}`);
+    const filePath = join(dir, "tasks.json");
+    mkdirSync(dir, { recursive: true });
+    try {
+      // A task file written before the blocking feature — no blockedBy/blocks/metadata.
+      writeFileSync(filePath, JSON.stringify({
+        nextId: 2,
+        tasks: [{
+          id: "1",
+          subject: "Legacy task",
+          description: "From an older version",
+          status: "pending",
+        }],
+      }));
+
+      const task = new TaskStore(filePath).get("1")!;
+      expect(task.blockedBy).toEqual([]);
+      expect(task.blocks).toEqual([]);
+      expect(task.metadata).toEqual({});
+      expect(task.subject).toBe("Legacy task"); // existing fields preserved
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the backing directory lazily — not on construction, but on first write", () => {
+    const parentDir = join(tmpdir(), `pi-tasks-lazy-${Date.now()}`);
+    const filePath = join(parentDir, "tasks.json");
+    try {
+      const store = new TaskStore(filePath);
+      // Constructing a store must not create the directory for a session that
+      // never persists a task.
+      expect(existsSync(parentDir)).toBe(false);
+
+      store.create("Task", "Desc");
+      // The first mutation creates it.
+      expect(existsSync(parentDir)).toBe(true);
+      expect(existsSync(filePath)).toBe(true);
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("TaskStore (list ID resolution)", () => {
+  it("resolves a bare list ID under the user's home directory, not the working directory", async () => {
+    // PI_TASKS=my-list is a shared-list name, not a path — it must land in
+    // ~/.pi/tasks/. TASKS_DIR is computed at module load, so the module has to be
+    // re-imported after HOME is stubbed.
+    const home = mkdtempSync(join(tmpdir(), "pi-tasks-home-"));
+    vi.stubEnv("HOME", home);
+    vi.resetModules();
+    try {
+      const { TaskStore: FreshTaskStore } = await import("../src/task-store.js");
+      new FreshTaskStore("my-list").create("Shared list task", "d");
+
+      expect(existsSync(join(home, ".pi", "tasks", "my-list.json"))).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("TaskStore (malformed files)", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-tasks-malformed-"));
+    file = join(dir, "tasks.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("continues IDs after the highest existing task when nextId is missing", () => {
+    // A truncated write, a bad merge or a hand edit can drop the envelope fields.
+    // `nextId` decides every future ID, so an unusable one used to produce the task
+    // ID "NaN", then IDs restarting at "0" and colliding with live tasks.
+    writeFileSync(file, JSON.stringify({
+      tasks: [
+        { id: "1", subject: "One", description: "d", status: "completed" },
+        { id: "7", subject: "Seven", description: "d", status: "pending" },
+      ],
+    }));
+
+    expect(new TaskStore(file).create("Next", "d").id).toBe("8");
+  });
+
+  it("starts from 1 when nextId is missing and there are no tasks", () => {
+    writeFileSync(file, JSON.stringify({ tasks: [] }));
+
+    expect(new TaskStore(file).create("First", "d").id).toBe("1");
+  });
+
+  it("does not reissue an ID that a task already holds", () => {
+    writeFileSync(file, JSON.stringify({
+      nextId: 2,
+      tasks: [
+        { id: "1", subject: "One", description: "d", status: "pending" },
+        { id: "5", subject: "Five", description: "d", status: "pending" },
+      ],
+    }));
+
+    expect(new TaskStore(file).create("Next", "d").id).toBe("6");
+  });
+
+  it("keeps the tasks it has when the file has no task array", () => {
+    const store = new TaskStore(file);
+    store.create("Keep me", "d");
+    writeFileSync(file, JSON.stringify({ nextId: 5 }));
+
+    expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+  });
+
+  it("keeps the tasks it has when the file is not valid JSON", () => {
+    const store = new TaskStore(file);
+    store.create("Keep me", "d");
+    writeFileSync(file, "{ this is not json");
+
+    expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+  });
+
+  it("keeps the tasks it has when the file holds a JSON array", () => {
+    const store = new TaskStore(file);
+    store.create("Keep me", "d");
+    writeFileSync(file, JSON.stringify([{ id: "1" }]));
+
+    expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+  });
+
+  it("skips entries that are not task records", () => {
+    writeFileSync(file, JSON.stringify({
+      nextId: 3,
+      tasks: [null, 5, "nope", { subject: "no id" }, { id: "2", subject: "Real", description: "d", status: "pending" }],
+    }));
+
+    expect(new TaskStore(file).list().map(t => t.subject)).toEqual(["Real"]);
+  });
+
+  it("respects a valid nextId", () => {
+    writeFileSync(file, JSON.stringify({
+      nextId: 42,
+      tasks: [{ id: "1", subject: "One", description: "d", status: "pending" }],
+    }));
+
+    expect(new TaskStore(file).create("Next", "d").id).toBe("42");
   });
 });

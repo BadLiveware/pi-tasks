@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { test } from "vitest";
 
 test("host-provided modules are wildcard peers, not runtime dependencies", () => {
@@ -32,20 +36,14 @@ test("host-provided modules are wildcard peers, not runtime dependencies", () =>
   }
 });
 
-test("development dependencies exercise the Pi 1.0.2 host modules", () => {
-  const manifest = JSON.parse(
-    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
-  );
-  for (const name of [
-    "@earendil-works/pi-coding-agent",
-    "@earendil-works/pi-tui",
-  ]) {
-    assert.equal(manifest.devDependencies[name], "1.0.2", name);
-  }
-  assert.equal(manifest.devDependencies.typebox, "1.3.27");
-  for (const section of [manifest.peerDependencies, manifest.devDependencies]) {
-    assert.ok(!Object.keys(section).some((name) => name.startsWith("@mariozechner/")));
-  }
+test("host modules load and validate tool parameters together", () => {
+  assert.ok(getAgentDir().length > 0);
+  const schema = Type.Object({ subject: Type.String() });
+  assert.equal(Value.Check(schema, { subject: "Task" }), true);
+  assert.equal(Value.Check(schema, { subject: 5 }), false);
+  const clipped = truncateToWidth("Long task subject", 10).replace(/\u001b\[[0-9;]*m/g, "");
+  assert.ok(clipped.length <= 10);
+  assert.ok(clipped.endsWith("..."));
 });
 
 test("source imports use the current Pi namespace", () => {
