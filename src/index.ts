@@ -39,7 +39,17 @@ import {
   onTurnStart,
   resetCadenceState,
 } from "./reminder-cadence.js";
-import { consumeStopHookSystemPrompt, createStopHookState, maybePromptForOpenTasks, resetStopHookPrompt } from "./stop-hook.js";
+import {
+  appendSystemInstructionToProviderPayload,
+  armStopHookSystemPrompt,
+  consumeStopHookSystemPrompt,
+  consumeStopHookTrigger,
+  createStopHookState,
+  maybeQueueOpenTaskStopCheck,
+  removeStopHookTriggerMessages,
+  resetStopHookPrompt,
+  TASK_STOP_HOOK_MESSAGE_TYPE,
+} from "./stop-hook.js";
 import { resolveTaskGlyphs } from "./task-glyphs.js";
 import { registerTaskMutationTools } from "./task-mutation-tools.js";
 import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
@@ -521,7 +531,36 @@ export default function (pi: ExtensionAPI) {
     widget.setUICtx(ctx.ui as UICtx);
     initializeStoreForContext(ctx);
     showPersistedTasks();
-    maybePromptForOpenTasks(pi, ctx, store.list(), stopHookState);
+    if (!maybeQueueOpenTaskStopCheck(ctx, store.list(), stopHookState)) return;
+    const trigger = consumeStopHookTrigger(stopHookState);
+    if (!trigger) return;
+    armStopHookSystemPrompt(stopHookState, trigger.prompt);
+    pi.sendMessage({
+      customType: TASK_STOP_HOOK_MESSAGE_TYPE,
+      content: "",
+      display: false,
+      details: {
+        openTaskIds: trigger.openTaskIds,
+        source: "agent_end",
+        promptDelivery: "before_provider_request.system",
+        triggerOnly: true,
+      },
+    }, { triggerTurn: true, deliverAs: "followUp" });
+  });
+
+  // The hidden custom message only triggers the continuation turn. Custom
+  // messages serialize as user-role model input, so remove this transport marker
+  // before every provider call. before_provider_request adds the actual guidance
+  // to the provider's native system/instructions field for this one continuation.
+  pi.on("context", async (event) => {
+    const messages = removeStopHookTriggerMessages(event.messages);
+    if (messages.length !== event.messages.length) return { messages };
+  });
+
+  pi.on("before_provider_request", async (event) => {
+    const prompt = consumeStopHookSystemPrompt(stopHookState);
+    if (!prompt) return;
+    return appendSystemInstructionToProviderPayload(event.payload, prompt);
   });
 
   // The end of a run is the only signal that separates a new batch of tasks from the
@@ -655,7 +694,7 @@ export default function (pi: ExtensionAPI) {
 
   // Fallback for hosts that init UI lazily. Guarded by persistedTasksShown, so
   // it never double-renders after session_start.
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", async (_event, ctx) => {
     latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     initializeStoreForContext(ctx);
@@ -665,8 +704,6 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(pendingWarning, "warning");
       pendingWarning = undefined;
     }
-    const stopHookPrompt = consumeStopHookSystemPrompt(stopHookState);
-    if (stopHookPrompt) return { systemPrompt: `${event.systemPrompt}\n\n${stopHookPrompt}` };
   });
 
   // Keep latestCtx fresh on every tool execution as well.

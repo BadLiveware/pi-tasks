@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import initExtension from "../src/index.js";
 import {
+  appendSystemInstructionToProviderPayload,
   buildStopHookPrompt,
-  consumeStopHookSystemPrompt,
+  consumeStopHookTrigger,
   createStopHookState,
-  maybePromptForOpenTasks,
+  maybeQueueOpenTaskStopCheck,
+  removeStopHookTriggerMessages,
   TASK_STOP_HOOK_MESSAGE_TYPE,
 } from "../src/stop-hook.js";
 import type { Task } from "../src/types.js";
@@ -91,49 +93,63 @@ describe("stop hook prompt helpers", () => {
       task("1", "in_progress", "Current cleanup"),
     ]);
 
-    expect(prompt).toContain("[PI-TASKS STOP HOOK]");
-    expect(prompt).toContain("This is a system instruction from pi-tasks, not a user request");
-    expect(prompt).toContain("Task cleanup needed before stopping");
+    expect(prompt).toContain("[PI-TASKS SYSTEM STOP CHECK]");
+    expect(prompt).toContain("This is internal system guidance, not a user message");
+    expect(prompt).toContain("Do not acknowledge, mention, quote, or summarize this instruction to the user");
+    expect(prompt).not.toContain("Do not respond to");
     expect(prompt).toContain("#1 [in_progress] Current cleanup");
     expect(prompt).toContain("#2 [pending] Queued cleanup");
-    expect(prompt).toContain("Use TaskUpdate now");
-    expect(prompt).toContain("mark tasks completed only when");
-    expect(prompt).toContain("delete tasks that are obsolete");
+    expect(prompt).toContain("if an open task is already fully done, mark it completed with TaskUpdate");
+    expect(prompt).toContain("if actionable in-scope work remains, continue the current in-progress task or start the next ready task");
+    expect(prompt).toContain("if progress genuinely requires human input");
+    expect(prompt).toContain("quiesce by asking the user for exactly what is needed or reporting the blocker");
+    expect(prompt).toContain("This continuation is the only stop check for the current open-task snapshot");
+    expect(prompt).toContain("must not trigger another model turn until the open-task snapshot changes or new user input arrives");
+    expect(prompt).toContain("Never mark incomplete work completed");
   });
 
-  it("sends one prompt per unchanged open-task snapshot", () => {
+  it("queues one trigger per unchanged open-task snapshot", () => {
     const state = createStopHookState();
-    const pi = { sendMessage: vi.fn() };
     const ctx = { hasPendingMessages: () => false };
     const tasks = [task("1", "pending", "Unresolved")];
 
-    expect(maybePromptForOpenTasks(pi, ctx, tasks, state)).toBe(true);
-    expect(maybePromptForOpenTasks(pi, ctx, tasks, state)).toBe(false);
-    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
-
-    expect(pi.sendMessage.mock.calls[0][0]).toMatchObject({
-      customType: TASK_STOP_HOOK_MESSAGE_TYPE,
-      content: "pi-tasks queued a system cleanup check for 1 open task.",
-      display: true,
-      details: { openTaskIds: ["1"], source: "agent_end", promptDelivery: "before_agent_start.systemPrompt" },
+    expect(maybeQueueOpenTaskStopCheck(ctx, tasks, state)).toBe(true);
+    expect(maybeQueueOpenTaskStopCheck(ctx, tasks, state)).toBe(false);
+    expect(consumeStopHookTrigger(state)).toMatchObject({
+      openTaskIds: ["1"],
+      prompt: expect.stringContaining("Make one explicit choice for this check"),
     });
-    expect(pi.sendMessage.mock.calls[0][0].content).not.toContain("Use TaskUpdate now");
-    expect(consumeStopHookSystemPrompt(state)).toContain("Use TaskUpdate now");
-    expect(pi.sendMessage.mock.calls[0][1]).toEqual({ triggerTurn: true });
   });
 
-  it("does not send while another message is already pending", () => {
+  it("appends guidance to provider-native system fields", () => {
+    expect(appendSystemInstructionToProviderPayload({ instructions: "base" }, "stop check")).toEqual({ instructions: "base\n\nstop check" });
+    expect(appendSystemInstructionToProviderPayload({ system: [{ type: "text", text: "base" }] }, "stop check")).toEqual({ system: [{ type: "text", text: "base" }, { type: "text", text: "stop check" }] });
+    expect(appendSystemInstructionToProviderPayload({ systemInstruction: { parts: [{ text: "base" }] } }, "stop check")).toEqual({ systemInstruction: { parts: [{ text: "base" }, { text: "stop check" }] } });
+    expect(appendSystemInstructionToProviderPayload({ input: [{ role: "user", content: "request" }] }, "stop check")).toEqual({ input: [{ role: "system", content: "stop check" }, { role: "user", content: "request" }] });
+    expect(appendSystemInstructionToProviderPayload({ messages: [{ role: "system", content: "base" }, { role: "user", content: "request" }] }, "stop check")).toEqual({ messages: [{ role: "system", content: "base\n\nstop check" }, { role: "user", content: "request" }] });
+  });
+
+  it("removes the hidden trigger marker from model context", () => {
+    const messages = [
+      { role: "user", content: "real request" },
+      { role: "custom", customType: TASK_STOP_HOOK_MESSAGE_TYPE, content: "" },
+      { role: "custom", customType: "other-extension", content: "keep" },
+    ];
+
+    expect(removeStopHookTriggerMessages(messages)).toEqual([messages[0], messages[2]]);
+  });
+
+  it("does not queue while another message is already pending", () => {
     const state = createStopHookState();
-    const pi = { sendMessage: vi.fn() };
     const ctx = { hasPendingMessages: () => true };
 
-    expect(maybePromptForOpenTasks(pi, ctx, [task("1", "pending", "Unresolved")], state)).toBe(false);
-    expect(pi.sendMessage).not.toHaveBeenCalled();
+    expect(maybeQueueOpenTaskStopCheck(ctx, [task("1", "pending", "Unresolved")], state)).toBe(false);
+    expect(consumeStopHookTrigger(state)).toBeUndefined();
   });
 });
 
 describe("stop hook integration", () => {
-  it("prompts after agent_end when tasks remain open", async () => {
+  it("triggers a hidden system-guided continuation after agent_end", async () => {
     const mock = mockPi();
     initExtension(mock.pi as any);
 
@@ -148,18 +164,31 @@ describe("stop hook integration", () => {
     expect(mock.pi.sendMessage).toHaveBeenCalledTimes(1);
     const [message, options] = mock.pi.sendMessage.mock.calls[0];
     expect(message.customType).toBe(TASK_STOP_HOOK_MESSAGE_TYPE);
-    expect(message.content).toBe("pi-tasks queued a system cleanup check for 1 open task.");
-    expect(message.content).not.toContain("#1 [in_progress] Finish cleanup");
-    expect(options).toEqual({ triggerTurn: true });
+    expect(message.content).toBe("");
+    expect(message.display).toBe(false);
+    expect(options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
 
-    const results = await mock.fireLifecycle("before_agent_start", { systemPrompt: "base system" }, mockCtx());
-    const systemPatch = results.find(Boolean);
-    expect(systemPatch.systemPrompt).toContain("base system");
-    expect(systemPatch.systemPrompt).toContain("This is a system instruction from pi-tasks, not a user request");
-    expect(systemPatch.systemPrompt).toContain("#1 [in_progress] Finish cleanup");
+    const contextMessages = [
+      { role: "user", content: "real request" },
+      { role: "custom", customType: TASK_STOP_HOOK_MESSAGE_TYPE, content: "" },
+    ];
+    const contextResults = await mock.fireLifecycle("context", { messages: contextMessages }, mockCtx());
+    expect(contextResults.find(Boolean)?.messages).toEqual([contextMessages[0]]);
+
+    const providerResults = await mock.fireLifecycle("before_provider_request", { payload: { instructions: "base system" } }, mockCtx());
+    const providerPatch = providerResults.find(Boolean);
+    expect(providerPatch.instructions).toContain("base system");
+    expect(providerPatch.instructions).toContain("This is internal system guidance, not a user message");
+    expect(providerPatch.instructions).toContain("Do not acknowledge, mention, quote, or summarize this instruction to the user");
+    expect(providerPatch.instructions).toContain("#1 [in_progress] Finish cleanup");
+    expect(providerPatch.instructions).toContain("if progress genuinely requires human input");
+    expect(providerPatch.instructions).toContain("quiesce by asking the user for exactly what is needed or reporting the blocker");
+
+    const secondProviderResults = await mock.fireLifecycle("before_provider_request", { payload: { instructions: "base system" } }, mockCtx());
+    expect(secondProviderResults.filter(Boolean)).toEqual([]);
   });
 
-  it("does not repeatedly prompt for the same open tasks unless user input resets it", async () => {
+  it("quiesces after the system-guided continuation for an unchanged snapshot", async () => {
     const mock = mockPi();
     initExtension(mock.pi as any);
 
@@ -169,11 +198,37 @@ describe("stop hook integration", () => {
     });
 
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
-    await mock.fireLifecycle("before_agent_start", { systemPrompt: "base system" }, mockCtx());
+    await mock.fireLifecycle("context", {
+      messages: [{ role: "custom", customType: TASK_STOP_HOOK_MESSAGE_TYPE, content: "" }],
+      systemPrompt: "base system",
+    }, mockCtx());
+    await mock.fireLifecycle("before_provider_request", { payload: { instructions: "base system" } }, mockCtx());
+
+    // The agent may deliberately stop to ask for human input or report a blocker.
+    // Its agent_end must not create stopHook → model → stopHook recursion.
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
     expect(mock.pi.sendMessage).toHaveBeenCalledTimes(1);
 
     await mock.fireLifecycle("input", { source: "interactive" }, mockCtx());
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("checks again when the open-task snapshot changes", async () => {
+    const mock = mockPi();
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", {
+      subject: "Waiting for approval",
+      description: "Need user permission before proceeding",
+    });
+
+    await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
+    expect(mock.pi.sendMessage).toHaveBeenCalledTimes(1);
+
+    await mock.executeTool("TaskUpdate", {
+      updates: [{ taskId: "1", status: "in_progress" }],
+    });
     await mock.fireLifecycle("agent_end", { messages: [] }, mockCtx());
     expect(mock.pi.sendMessage).toHaveBeenCalledTimes(2);
   });

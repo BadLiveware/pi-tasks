@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **Hierarchical task trees** — model parent/subtask relationships, nested trees, aggregate subtask progress, parallel-capable siblings, and ready-to-complete parent hints
 - **Persistent widget** — live task list above the editor with tree connectors, `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, a Pi-style braille spinner (`⠋⠙⠹⠸`) for active tasks, and a smart viewport that keeps active/actionable work visible in larger lists
 - **System-reminder injection** — periodic `<system-reminder>` nudges injected into the upcoming model request through the `context` hook, never persisted or added to unrelated tool output; also detects stale in-progress tasks
-- **Stop-hook cleanup prompt** — when an agent stops with open tasks, pi-tasks injects a follow-up prompt asking it to complete finished tasks, delete obsolete ones, or keep working real in-scope work instead of leaving abandoned rows behind
+- **Stop-hook cleanup prompt**: when an agent stops with open tasks, pi-tasks injects one follow-up decision: clean up finished/obsolete tasks, keep working actionable tasks, or explicitly quiesce when human input or another real blocker is required
 - **Configurable widget** — [custom glyphs](CUSTOMIZING.md#task-glyphs), sort presets and sort specs, completed-task collapse, and explicit top/bottom visible limits
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
 - **Dependency and relationship management** — hard `blocks`/`blockedBy` dependencies plus non-blocking relationships such as `parent`, `related`, `validates`, `supersedes`, and `orderAfter`
@@ -379,8 +379,7 @@ Both auto-clear modes use a turn-based delay for non-jarring UX — tasks linger
 
 ### Stop-hook open task cleanup
 
-On `agent_end`, if pending or in-progress tasks remain and no other extension follow-up is pending, pi-tasks injects a follow-up prompt that tells the agent to resolve the list before stopping: complete only fully finished tasks, delete obsolete or accidental tasks, and continue real in-scope work instead of leaving stale tasks behind.
-The hook fingerprints the current open-task snapshot so the same unresolved list is not re-prompted in a loop; new user input and session switches reset the prompt gate.
+On `agent_end`, if pending or in-progress tasks remain and no other extension follow-up is pending, pi-tasks triggers one extra turn with hidden transport and injects the decision instructions into the provider's native system/instructions field for that continuation. The trigger marker is removed from model context, so it cannot appear as a user message. The agent must explicitly choose to mark finished tasks completed, delete obsolete tasks, continue actionable work, or quiesce because progress genuinely needs human input, permission, unavailable information, or another blocker. When quiescing, it may ask the user for exactly what is needed without mentioning the hook itself. The hook fingerprints the open-task snapshot, so the continuation's own `agent_end` does not create a `stopHook → model → stopHook` loop; it checks again only after the task snapshot changes or new user input arrives. Session switches also reset the prompt gate.
 
 
 In either mode, a list with nothing left to do is also retired when a *later* batch of work begins, however long it has been sitting there. The turn delay only runs while the conversation does, so a list completed just before the agent stopped would otherwise still be on screen when the next task arrived, and that task would join it. The finished list stays visible while you read it and through any follow-up question, and goes when the agent starts new work. Tasks the agent adds to a list it is still working through are unaffected, and task IDs stay monotonic and are never reused.
@@ -519,7 +518,7 @@ src/
 ├── auto-clear.ts       # Turn-based auto-clearing of completed tasks (AutoClearManager)
 ├── task-mutation-tools.ts # Batch creation/update registration and workflows
 ├── hierarchy.ts        # Parent/subtask trees and progress summaries
-├── stop-hook.ts        # agent_end follow-up prompt for unresolved task cleanup
+├── stop-hook.ts        # agent_end system guidance for unresolved task cleanup
 ├── tasks-config.ts     # Global defaults and project override persistence
 ├── task-paths.ts       # Where session task files live, per taskScope
 ├── task-glyphs.ts      # Glyph defaults and config validation
